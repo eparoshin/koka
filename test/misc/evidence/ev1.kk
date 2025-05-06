@@ -1,7 +1,3 @@
-pub module ev1
-
-import std/core/hnd
-
 effect exc {
   control throw() : a
 }

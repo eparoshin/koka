@@ -8,7 +8,7 @@ effect evil {
 
 val reader-one = handler { fun ask() { 1 } }
 
-// forall<a,e>. (() -> <evil/evil|e> (() -> e a)) -> e (() -> e a)
+//forall<a,e>. (() -> <evil/evil|e> (() -> e a)) -> e (() -> e a)
 //forall<a,e>. (() -> <evil/evil|e> (() -> e a)) -> e (() -> e a)
 val hevil = handler { 
   control evil() { (fn(){ resume(())() } ) } 

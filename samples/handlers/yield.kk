@@ -1,17 +1,18 @@
 // a generator effect with one operation
 effect yield<a>
-  fun yield( x : a ) : ()
+  ctl yield( x : a ) : ()
 
-// traverse a list and yield the elements
-fun traverse( xs : list<a> ) : yield<a> ()
-  match xs
-    Cons(x,xx) -> { yield(x); traverse(xx) }
-    Nil        -> ()
+fun traverse( from : int, to : int ) : <div,yield<int>> ()
+  if from < to then
+    yield(from)
+    yield(from * 2)
+    traverse(from + 1, to)
 
 // bind the yield operation dynamically
-pub fun main() : console ()
-  with fun yield( i : int)
-         println("yielded " ++ i.show)
-  [1,2,3].traverse
+pub fun main() : _e ()
+  with ctl yield( i : int)
+      println("yielded " ++ i.show)
+      if i != 5 then resume(()) else ()
+  traverse(0, 10)
   println("done")
 
