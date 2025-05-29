@@ -63,6 +63,7 @@ pub noinline fun taskn( count : int, stride : int, work : () -> pure a, combine 
 // LVar's
 // Note: currently unsafe in the pure effect!! needs work
 
+/*
 abstract struct lvar<a>
   lv : any
 
@@ -84,3 +85,4 @@ pub fun put( lvar : lvar<a>, x : a, monotonic-combine : (a,a) -> a ) : pure ()
 pub fun get( lvar : lvar<a>, bot : a, is-gte: (a,a) -> bool ) : pure a
   unsafe-get( lvar.lv, bot, fn(x,y){ if (is-gte(x,y)) then one else zero } )
 
+  */

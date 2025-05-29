@@ -27,6 +27,7 @@ typedef struct promise_s {
   kk_box_t        result;
   kk_atomic(bool) is_set;
   pthread_mutex_t lock;
+  kk_atomic(uintptr_t) lq;
   pthread_cond_t  available;
 } promise_t;
 
@@ -122,6 +123,7 @@ typedef struct kk_local_queue_s {
     parking_slot_t ps;
     kk_ssize_t    gqueue_counter;
     kk_ws_queue_t* lq;
+    struct kk_task_group_s* tg;
 } kk_local_queue_t;
 
 typedef struct kk_local_worker_s {
@@ -177,6 +179,22 @@ static bool wake_worker(kk_task_group_t* tg) {
     return false;
 }
 
+static bool wake_the_worker(kk_local_queue_t* lq) {
+    kk_task_group_t* tg = lq->tg;
+    parking_slot_t* ps = &lq->ps;
+    pthread_mutex_lock(&tg->idle_lock);
+    if (ps->next != NULL && ps->prev != NULL) {
+        ps->next->prev = ps->prev;;
+        ps->prev->next = ps->next;;
+        wake(ps);
+        decr_idle(tg);
+        pthread_mutex_unlock(&tg->idle_lock);
+        return true;
+    }
+    pthread_mutex_unlock(&tg->idle_lock);
+    return false;
+}
+
 static void become_inactive(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_lock(&tg->idle_lock);
     ps->prev = &tg->idle_head;
@@ -200,7 +218,8 @@ static void become_active(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_unlock(&tg->idle_lock);
 }
 
-static int kk_local_queue_init(kk_local_queue_t* lq, kk_context_t* ctx) {
+static int kk_local_queue_init(kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
+    lq->tg = tg;
     if ((lq->lq = kk_ws_queue_alloc(fifo, ctx)) == 0) {
         return -1;
     }
@@ -544,7 +563,7 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
   if (pthread_mutex_init(&tg->tasks_lock, NULL) != 0) goto err;
   if (pthread_mutex_init(&tg->idle_lock, NULL) != 0) goto err;
   for (kk_ssize_t i = 0; i < tg->workers_count; i++) {
-    if (kk_local_queue_init(&tg->workers[i].lq, ctx) != 0) goto err;
+    if (kk_local_queue_init(tg, &tg->workers[i].lq, ctx) != 0) goto err;
     struct kk_worker_args_s* args = (struct kk_worker_args_s*)kk_malloc(sizeof(struct kk_worker_args_s), ctx);
     args->tg = tg;
     args->idx = i;
@@ -618,8 +637,12 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   pthread_mutex_lock(&p->lock);
   kk_box_drop(p->result,ctx);
   p->result = r;
-  kk_atomic_store_release(&p->is_set, true);
+  kk_atomic_store_seq_cst(&p->is_set, true);
   pthread_mutex_unlock(&p->lock);
+  kk_local_queue_t* lq = (kk_local_queue_t*)kk_atomic_load_seq_cst(&p->lq);
+  if (lq != NULL) {
+      wake_the_worker(lq);
+  }
   pthread_cond_signal(&p->available);
   kk_box_drop(pr,ctx);
 }
@@ -637,21 +660,24 @@ static bool kk_promise_available( kk_promise_t pr, kk_context_t* ctx ) {
 
 kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {  
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr,ctx);
-  while (!kk_atomic_load_acquire(&p->is_set)) {
-    // if part of a task group, run other tasks while waiting
     if (ctx->task_group != NULL) {
       kk_task_group_t* tg = ctx->task_group;
       kk_local_queue_t* lq = ctx->local_queue;
       kk_assert(ctx->local_queue != NULL);
+      kk_atomic_store_seq_cst(&p->lq, (uintptr_t)lq);
+  while (!kk_atomic_load_seq_cst(&p->is_set)) {
+    // if part of a task group, run other tasks while waiting
       ++lq->gqueue_counter;
-      kk_task_t* task = kk_try_pop(tg, lq, ctx);
+      kk_task_t* task = kk_pop(tg, lq, ctx);
       if (task == NULL) {
           continue;
       }
       kk_task_exec(task, ctx);
     }
+    }
     // if in the main thread do a blocking wait
     else {
+    while (!kk_atomic_load_acquire(&p->is_set)) {
       pthread_mutex_lock( &p->lock);
       pthread_cond_wait( &p->available, &p->lock );
     }

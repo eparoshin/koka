@@ -35,6 +35,7 @@
 #define kk_atomic_load_seq_cst(p)           kk_atomic(load_explicit)(p,kk_memory_order(seq_cst))
 #define kk_atomic_load_relaxed(p)           kk_atomic(load_explicit)(p,kk_memory_order(relaxed))
 #define kk_atomic_load_acquire(p)           kk_atomic(load_explicit)(p,kk_memory_order(acquire))
+#define kk_atomic_store_seq_cst(p,x)        kk_atomic(store_explicit)(p,x,kk_memory_order(seq_cst))
 #define kk_atomic_store_relaxed(p,x)        kk_atomic(store_explicit)(p,x,kk_memory_order(relaxed))
 #define kk_atomic_store_release(p,x)        kk_atomic(store_explicit)(p,x,kk_memory_order(release))
 
