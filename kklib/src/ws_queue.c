@@ -8,6 +8,9 @@ void kk_init_fifo(kk_ws_queue_fifo_t* q, kk_context_t* ctx) {
 
 kk_ws_queue_t* kk_ws_queue_alloc(kk_ws_queue_type_e type, kk_context_t* ctx) {
     kk_ws_queue_t* result = kk_malloc(sizeof(kk_ws_queue_t), ctx);
+    if (result == NULL) {
+        return result;
+    }
     result->type = type;
     switch (type) {
         case lifo:

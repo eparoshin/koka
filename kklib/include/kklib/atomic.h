@@ -32,6 +32,7 @@
 #define  KK_ATOMIC_VAR_INIT(x)  ATOMIC_VAR_INIT(x)
 #endif
 
+#define kk_atomic_load_seq_cst(p)           kk_atomic(load_explicit)(p,kk_memory_order(seq_cst))
 #define kk_atomic_load_relaxed(p)           kk_atomic(load_explicit)(p,kk_memory_order(relaxed))
 #define kk_atomic_load_acquire(p)           kk_atomic(load_explicit)(p,kk_memory_order(acquire))
 #define kk_atomic_store_relaxed(p,x)        kk_atomic(store_explicit)(p,x,kk_memory_order(relaxed))
@@ -44,13 +45,17 @@
 #define kk_atomic_cas_strong_relaxed(p,exp,des) kk_atomic(compare_exchange_strong_explicit)(p,exp,des,kk_memory_order(relaxed),kk_memory_order(relaxed))
 #define kk_atomic_cas_strong_acq_rel(p,exp,des) kk_atomic(compare_exchange_strong_explicit)(p,exp,des,kk_memory_order(acq_rel),kk_memory_order(acquire))
 
+#define kk_atomic_add_seq_cst(p,x)          kk_atomic(fetch_add_explicit)(p,x,kk_memory_order(seq_cst))
 #define kk_atomic_add_relaxed(p,x)          kk_atomic(fetch_add_explicit)(p,x,kk_memory_order(relaxed))
 #define kk_atomic_add_release(p,x)          kk_atomic(fetch_add_explicit)(p,x,kk_memory_order(release))
+#define kk_atomic_sub_seq_cst(p,x)          kk_atomic(fetch_sub_explicit)(p,x,kk_memory_order(seq_cst))
 #define kk_atomic_sub_relaxed(p,x)          kk_atomic(fetch_sub_explicit)(p,x,kk_memory_order(relaxed))
 #define kk_atomic_sub_release(p,x)          kk_atomic(fetch_sub_explicit)(p,x,kk_memory_order(release))
 
+#define kk_atomic_inc_seq_cst(p)            kk_atomic_add_seq_cst(p,1)
 #define kk_atomic_inc_relaxed(p)            kk_atomic_add_relaxed(p,1)
 #define kk_atomic_inc_release(p)            kk_atomic_add_release(p,1)
+#define kk_atomic_dec_seq_cst(p)            kk_atomic_sub_seq_cst(p,1)
 #define kk_atomic_dec_relaxed(p)            kk_atomic_sub_relaxed(p,1)
 #define kk_atomic_dec_release(p)            kk_atomic_sub_release(p,1)
 

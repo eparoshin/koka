@@ -82,36 +82,62 @@ static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
 
 // TODO(eparoshin) windows
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 typedef struct parking_slot_s {
-    uint32_t epoch;
+    struct parking_slot_s* next;
+    struct parking_slot_s* prev;
+    kk_atomic(uint) epoch;
 } parking_slot_t;
 
-typedef enum kk_tg_type {
-    gq,
-    ws,
-} kk_tg_type_e;
+static_assert(sizeof(unsigned int) == 4, "");
 
+void futex_wait(uint32_t* value, uint32_t expected_value) {
+    syscall(SYS_futex, value, FUTEX_WAIT_PRIVATE, expected_value, nullptr, nullptr, 0);
+}
 
-typedef struct kk_task_group_gq {
-  bool            done;
+// Wakeup 'count' threads sleeping on address of value (-1 wakes all)
+void futex_wake(uint32_t* value, uint32_t count) {
+    syscall(SYS_futex, value, FUTEX_WAKE_PRIVATE, count, nullptr, nullptr, 0);
+}
+
+uint32_t prepare_park(parking_slot_t* slot) {
+    return kk_atomic_load_seq_cst(&slot->epoch);
+}
+
+void try_park(parking_slot_t* slot, uint32_t desired) {
+    futex_wait(&slot->epoch, desired);
+}
+
+void wake(parking_slot_t* slot) {
+    kk_atomic_inc_seq_cst(&slot->epoch);
+    futex_wake(&slot->epoch, -1);
+}
+
+// SPMC ring buffer
+typedef struct kk_local_queue_s {
+    parking_slot_t ps;
+    kk_ssize_t    gqueue_counter;
+    kk_ws_queue_t* lq;
+} kk_local_queue_t;
+
+typedef struct kk_local_worker_s {
+    kk_local_queue_t lq;
+    pthread_t thread;
+} kk_local_worker_t;
+
+typedef struct kk_task_group_s {
+  kk_atomic(bool) done;
   kk_task_t*      tasks;
   kk_task_t*      tasks_tail;
   pthread_mutex_t tasks_lock;
-  pthread_t*      threads;
-} kk_task_group_gq_t;
-
-typedef struct kk_task_group_ws_s {
-  kk_task_group_gq_t gq;
-
-
-} kk_task_group_ws_t;
-
-typedef struct kk_task_group_s {
-    kk_tg_type_e type;
-    union {
-        kk_task_group_ws_t ws;
-        kk_task_group_gq_t gq;
-    };
+  kk_atomic(size_t) state;
+  pthread_mutex_t idle_lock;
+  parking_slot_t idle_head;
+  kk_local_worker_t* workers;
+  size_t workers_count;
 } kk_task_group_t;
 
 enum constants {
@@ -119,31 +145,52 @@ enum constants {
     num_lifo_pushes = 5,
 };
 
-// SPMC ring buffer
-typedef struct kk_local_queue_s {
-    kk_ssize_t    gqueue_counter;
-    kk_ws_queue_t* lq;
-} kk_local_queue_t;
-
 typedef enum push_strategy {
     push_lifo,
     push_global,
     uptoyou,
 } push_strategy_e;
 
-__thread kk_local_queue_t* local_queue = NULL;
-
-static void kk_local_queue_init(kk_context_t* ctx) {
-    kk_assert(local_queue == NULL);
-    local_queue = kk_zalloc(sizeof(kk_local_queue_t), ctx);
-    local_queue->lq = kk_ws_queue_alloc(fifo, ctx);
+static void incr_idle(kk_task_group_t* tg) {
+    kk_atomic_add_seq_cst(&tg->state, 1ull << 32);
 }
 
-static void kk_local_queue_free(kk_context_t* ctx) {
-    kk_assert(local_queue != NULL);
-    kk_ws_queue_free(local_queue->lq, ctx);
-    kk_free(local_queue, ctx);
-    local_queue = NULL;
+static void decr_idle(kk_task_group_t* tg) {
+    kk_atomic_sub_seq_cst(&tg->state, 1ull << 32);
+}
+
+static void become_inactive(kk_task_group_t* tg, parking_slot_t* ps) {
+    pthread_mutex_lock(&tg->idle_lock);
+    ps->prev = &tg->idle_head;
+    ps->next = tg->idle_head.next;
+    tg->idle_head.next = ps;
+    incr_idle(tg);
+    pthread_mutex_unlock(&tg->idle_lock);
+}
+
+static void become_active(kk_task_group_t* tg, parking_slot_t* ps) {
+    pthread_mutex_lock(&tg->idle_lock);
+    if (ps->next == NULL && ps->prev == NULL) {
+        return;
+    }
+    kk_assert(ps->next != NULL && ps->prev != NULL);
+    ps->prev->next = ps->next;
+    ps->next->prev = ps->prev;
+    ps->next = NULL;
+    ps->prev = NULL;
+    decr_idle(tg);
+    pthread_mutex_unlock(&tg->idle_lock);
+}
+
+static int kk_local_queue_init(kk_local_queue_t* lq, kk_context_t* ctx) {
+    if ((lq->lq = kk_ws_queue_alloc(fifo, ctx)) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void kk_local_queue_free(kk_local_queue_t* lq, kk_context_t* ctx) {
+    kk_ws_queue_free(lq->lq, ctx);
 }
 
 static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, kk_context_t* ctx) {
@@ -167,17 +214,66 @@ static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool lifo, kk_co
     return kk_ws_queue_put(q->lq, task);
 }
 
-static kk_task_t* kk_try_pop( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
+
+static kk_task_t* kk_try_grab_global( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
+}
+
+static kk_task_t* kk_try_pop_local( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
+}
+
+static kk_task_t* kk_try_pop_global( kk_task_group_t* tg, kk_context_t* ctx) {
+}
+
+static kk_task_t* kk_try_pop_before_park( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
+}
+
+static kk_task_t* kk_try_pop( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
+
+    //sometimes we need to pop from global queue for load balancing
+    kk_task_t* task = NULL;
+    if (lq->gqueue_counter % dvyukov_const == 0) {
+        if ((task = kk_try_pop_global(tg, ctx))) {
+            return task;
+        }
+    }
+
+    if ((task = kk_try_pop_local(tg, lq, ctx))) {
+        return task;
+    }
+
+    if ((task = kk_try_grab_global(tg, lq, ctx))) {
+        return task;
+    }
+}
+
+static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
+    while (!kk_atomic_load_relaxed(&tg->done)) {
+        kk_task_t* task = NULL;
+        if ((task = kk_try_pop(tg, lq, ctx))) {
+            return task;
+        }
+
+        uint32_t epoch = prepare_park(&lq->ps);
+
+        become_inactive(tg, &lq->ps);
+
+        if ((task = kk_try_pop_before_park(tg, lq, ctx))) {
+            become_active(tg, &lq->ps);
+            return task;
+        }
+
+        if (kk_atomic_load_relaxed(&tg->done)) {
+            become_active(tg, &lq->ps);
+            return nullptr;
+        }
+
+        try_park(&lq->ps, epoch);
+
+    }
 }
 
 static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool lifo, kk_context_t* ctx) {
-    kk_local_queue_t* lq = local_queue;
-    //sometimes we need to push to global queue even for local tasks
-    if (++lq->gqueue_counter == dvyukov_const) {
-        lq->gqueue_counter = 0;
-        kk_enqueue_global(tg, task, ctx);
-        return;
-    }
+    kk_local_queue_t* lq = ctx->local_queue;
 
     if (!kk_try_push(lq, task, lifo, ctx)) {
         //try push failed
@@ -195,7 +291,9 @@ static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool lifo, k
 }
 
 
-static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t fun, enum push_strategy strategy, kk_context_t* ctx ) {
+static kk_promise_t kk_task_group_schedule( kk_function_t fun, enum push_strategy strategy, kk_context_t* ctx ) {
+  kk_task_group_t* tg = ctx->task_group;
+  kk_assert(tg != NULL);
   kk_promise_t p = kk_promise_alloc(ctx);
   kk_task_t* task = kk_task_alloc(fun, kk_box_dup(p,ctx), ctx);
 
@@ -213,19 +311,24 @@ static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t f
   return p;
 }
 
-static void* kk_task_group_worker( void* vtg ) {
-  kk_task_group_t* tg = (kk_task_group_t*)vtg;
+struct kk_worker_args_s {
+    kk_task_group_t* tg;
+    size_t idx;
+};
+
+static void* kk_task_group_worker( void* vargs ) {
+  struct kk_worker_args_s* args = (struct kk_worker_args_s*)vargs;
+  kk_task_group_t* tg = args->tg;
   kk_context_t*    ctx = kk_get_context();
   ctx->task_group = tg;
+  kk_local_queue_t* lq = &tg->workers[args->idx].lq;
+  ctx->local_queue = lq;
+
   while(true) {
      // deqeue task
      kk_task_t* task = NULL;
-     pthread_mutex_lock(&tg->tasks_lock);
-     while (kk_tasks_is_empty(tg) && !tg->done) {
-       pthread_cond_wait(&tg->tasks_available, &tg->tasks_lock);
-     }
-     task = kk_tasks_dequeue(tg);
-     pthread_mutex_unlock(&tg->tasks_lock);
+     ++lq->gqueue_counter;
+     task = kk_pop(tg, lq, ctx);
      if (task == NULL) {  // due to tg->done
        break;
      }
@@ -233,6 +336,7 @@ static void* kk_task_group_worker( void* vtg ) {
      // todo: ensure context is cleared again?
   }
   ctx->task_group = NULL;
+  kk_free(vargs, ctx);
   kk_free_context();
   return NULL;
 }
@@ -286,15 +390,21 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
   if (thread_cnt > 8*cpu_count) { thread_cnt = 8*cpu_count; };  
   kk_task_group_t* tg = (kk_task_group_t*)kk_zalloc( kk_ssizeof(kk_task_group_t), ctx );
   if (tg==NULL) return NULL;
-  tg->threads = (pthread_t*)kk_zalloc( (thread_cnt+1) * sizeof(pthread_t), ctx );
-  if (tg->threads == NULL) goto err;
-  tg->thread_count = thread_cnt;
+  tg->workers = (kk_local_worker_t*)kk_zalloc( (thread_cnt+1) * sizeof(kk_local_worker_t), ctx );
+  if (tg->workers == NULL) goto err;
+  tg->workers_count = thread_cnt;
   tg->tasks = NULL;
   tg->tasks_tail = NULL;
-  if (pthread_cond_init(&tg->tasks_available, NULL) != 0) goto err;
+  tg->idle_head.next = &tg->idle_head;
+  tg->idle_head.prev = &tg->idle_head;
   if (pthread_mutex_init(&tg->tasks_lock, NULL) != 0) goto err;
-  for (kk_ssize_t i = 0; i < tg->thread_count; i++) {
-    if (pthread_create(&tg->threads[i], NULL, &kk_task_group_worker, tg) != 0) {
+  if (pthread_mutex_init(&tg->idle_lock, NULL) != 0) goto err;
+  for (kk_ssize_t i = 0; i < tg->workers_count; i++) {
+    if (kk_local_queue_init(&tg->workers[i].lq, ctx) != 0) goto err;
+    struct kk_worker_args_s* args = (struct kk_worker_args_s*)kk_malloc(sizeof(struct kk_worker_args_s), ctx);
+    args->tg = tg;
+    args->idx = i;
+    if (pthread_create(&tg->workers[i].thread, NULL, &kk_task_group_worker, args) != 0) {
       goto err_threads;
     };
   }
@@ -302,11 +412,10 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
 
 err_threads:
   tg->done = true;
-  pthread_cond_broadcast(&tg->tasks_available); // makes threads exit
   
 err:
   if (tg != NULL) {
-    if (tg->threads != NULL) { kk_free(tg->threads,ctx); }
+    if (tg->workers != NULL) { kk_free(tg->workers,ctx); }
     kk_free(tg,ctx); 
   }
   return NULL;
@@ -327,7 +436,7 @@ kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
   if (ctx->task_group == NULL) { 
     ctx->task_group = task_group; // let main thread participate instead of blocking on a promise.get
   }
-  return kk_task_group_schedule( task_group, fun, ctx );
+  return kk_task_group_schedule( fun, uptoyou, ctx );
 }
 
 
