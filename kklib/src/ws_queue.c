@@ -51,6 +51,7 @@ bool kk_ws_queue_put(kk_ws_queue_t* q, void* task) {
         case fifo:
             return kk_ws_queue_put_fifo(&q->fifo_q, task);
     }
+    return false;
 }
 
 
@@ -61,7 +62,7 @@ void kk_ws_queue_force_put_many_fifo(kk_ws_queue_fifo_t* q, uintptr_t* tasks, si
     kk_assert(head == tail);
 
     for (size_t i = 0; i < sz; ++i) {
-        kk_atomic_store_relaxed(q->q + (tail % queue_size), tasks[i]);
+        kk_atomic_store_relaxed(q->q + ((tail + i) % queue_size), tasks[i]);
     }
 
     kk_atomic_store_release(&q->tail, tail + sz);
@@ -73,7 +74,7 @@ void kk_ws_queue_put_many(kk_ws_queue_t* q, uintptr_t* tasks, size_t sz) {
             kk_assert(false);
             break;
         case fifo:
-            kk_ws_queue_force_put_many_fifo(q, tasks, sz);
+            kk_ws_queue_force_put_many_fifo(&q->fifo_q, tasks, sz);
             break;
     }
 }
@@ -101,6 +102,7 @@ void* kk_ws_queue_pop(kk_ws_queue_t* q) {
         case fifo:
             return kk_ws_queue_pop_fifo(&q->fifo_q);
     }
+    return NULL;
 }
 
 size_t kk_ws_queue_grab_fifo(kk_ws_queue_fifo_t* q, uintptr_t* out) {
@@ -110,7 +112,7 @@ size_t kk_ws_queue_grab_fifo(kk_ws_queue_fifo_t* q, uintptr_t* out) {
 
         size_t num_to_grab = (tail - head + 1) / 2;
 
-        if (num_to_grab >= queue_size / 2) {
+        if (num_to_grab > queue_size / 2) {
             //inconsistent head and tail, retry
             continue;
         }
@@ -138,6 +140,7 @@ size_t kk_ws_queue_grab(kk_ws_queue_t* q, uintptr_t* out) {
         case fifo:
             return kk_ws_queue_grab_fifo(&q->fifo_q, out);
     }
+    return 0;
 }
 
 size_t kk_ws_queue_steal_fifo(kk_ws_queue_fifo_t* from, kk_ws_queue_fifo_t* to, uintptr_t* out_task) {
@@ -160,4 +163,5 @@ size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to, uintptr_t* out_
         case fifo:
             return kk_ws_queue_steal_fifo(&from->fifo_q, &to->fifo_q, out_task);
     }
+    return 0;
 }

@@ -37,7 +37,8 @@
 #include "ref.c"
 #include "refcount.c"
 #include "string.c"
-#include "thread.c"
+#include "ws_queue.c"
+#include "work_stealing_thread.c"
 #include "time.c"
 #include "vector.c"
 

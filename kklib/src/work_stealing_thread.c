@@ -110,12 +110,12 @@ uint32_t prepare_park(parking_slot_t* slot) {
 }
 
 void try_park(parking_slot_t* slot, uint32_t desired) {
-    futex_wait(&slot->epoch, desired);
+    futex_wait((uint32_t*)&slot->epoch, desired);
 }
 
 void wake(parking_slot_t* slot) {
     kk_atomic_inc_seq_cst(&slot->epoch);
-    futex_wake(&slot->epoch, -1);
+    futex_wake((uint32_t*)&slot->epoch, -1);
 }
 
 // SPMC ring buffer
@@ -179,6 +179,23 @@ static bool wake_worker(kk_task_group_t* tg) {
     return false;
 }
 
+static bool wake_worker_locked(kk_task_group_t* tg) {
+    if (tg->idle_head.next != &tg->idle_head) { //non empty
+        parking_slot_t* worker = tg->idle_head.next;
+        tg->idle_head.next = tg->idle_head.next->next;
+        wake(worker);
+        decr_idle(tg);
+        return true;
+    }
+    return false;
+}
+
+static void wake_all(kk_task_group_t* tg) {
+    pthread_mutex_lock(&tg->idle_lock);
+    while (wake_worker_locked(tg)) {}
+    pthread_mutex_unlock(&tg->idle_lock);
+}
+
 static bool wake_the_worker(kk_local_queue_t* lq) {
     kk_task_group_t* tg = lq->tg;
     parking_slot_t* ps = &lq->ps;
@@ -238,6 +255,7 @@ static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t
         tg->tasks_tail = ttail;
         tg->num_tasks = num_tasks;
         ttail->next = NULL;
+        pthread_mutex_unlock(&tg->tasks_lock);
         return;
     }
 
@@ -262,8 +280,8 @@ static void kk_notify_push( kk_task_group_t* tg, kk_context_t* ctx) {
     }
 }
 
-static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool lifo, kk_context_t* ctx) {
-    (void)lifo; //todo
+static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool islifo, kk_context_t* ctx) {
+    (void)islifo; //todo
     return kk_ws_queue_put(q->lq, task);
 }
 
@@ -321,16 +339,22 @@ static kk_task_t* try_steal_tasks(kk_task_group_t* tg, kk_local_queue_t* lq, siz
     kk_task_t* task = NULL;
     for (size_t i = 0; i < num_tries; ++i) {
         size_t idx = kk_srandom_uint64(ctx) % tg->workers_count;
-        kk_local_queue_t* sq = &tg->workers[idx].lq;
-        //dont steal from myself
-        if (sq == ctx->local_queue) {
-            --idx;
-            continue;
-        }
+        for (size_t j = 0; j < tg->workers_count; ++j) {
+            kk_local_queue_t* sq = &tg->workers[(j + idx) % tg->workers_count].lq;
+            kk_assert(sq);
+            kk_assert(lq);
+            kk_assert(ctx->local_queue);
+            //dont steal from myself
+            if (sq == lq) {
+                continue;
+            }
 
-        size_t num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, (uintptr_t*)&task);
-        if (num_stolen > 0) {
-            break;
+            kk_assert(sq->lq);
+            kk_assert(lq->lq);
+            size_t num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, (uintptr_t*)&task);
+            if (num_stolen > 0) {
+                return task;
+            }
         }
     }
     return task;
@@ -433,10 +457,10 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
     return nullptr;
 }
 
-static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool lifo, kk_context_t* ctx) {
+static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool islifo, kk_context_t* ctx) {
     kk_local_queue_t* lq = ctx->local_queue;
 
-    if (!kk_try_push(lq, task, lifo, ctx)) {
+    if (!kk_try_push(lq, task, islifo, ctx)) {
         //try push failed
         //offload 1/2 tasks to global queue
         kk_task_t* tasks_buff[queue_size / 2];
@@ -463,6 +487,7 @@ static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t f
       case push_lifo:
       case uptoyou:
           kk_enqueue_local(tg, task, strategy == push_lifo, ctx);
+          break;
       case push_global:
           kk_enqueue_global(tg, task, ctx);
           break;
@@ -564,6 +589,8 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
   if (pthread_mutex_init(&tg->idle_lock, NULL) != 0) goto err;
   for (kk_ssize_t i = 0; i < tg->workers_count; i++) {
     if (kk_local_queue_init(tg, &tg->workers[i].lq, ctx) != 0) goto err;
+  }
+  for (kk_ssize_t i = 0; i < tg->workers_count; i++) {
     struct kk_worker_args_s* args = (struct kk_worker_args_s*)kk_malloc(sizeof(struct kk_worker_args_s), ctx);
     args->tg = tg;
     args->idx = i;
@@ -596,7 +623,7 @@ kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
                                                          // overhead for checking on every schedule
   kk_assert(task_group != NULL);
   kk_block_mark_shared( kk_datatype_as_ptr(fun,ctx), ctx);  // mark everything reachable from the task as shared
-  kk_task_group_t* tg = ctx->task_group;
+  kk_task_group_t* tg = task_group;
   return kk_task_group_schedule( tg, fun, uptoyou, ctx );
 }
 
@@ -642,6 +669,7 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   kk_local_queue_t* lq = (kk_local_queue_t*)kk_atomic_load_seq_cst(&p->lq);
   if (lq != NULL) {
       wake_the_worker(lq);
+      //wake_all(lq->tg);
   }
   pthread_cond_signal(&p->available);
   kk_box_drop(pr,ctx);
@@ -678,11 +706,11 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
     // if in the main thread do a blocking wait
     else {
     while (!kk_atomic_load_acquire(&p->is_set)) {
-      pthread_mutex_lock( &p->lock);
-      pthread_cond_wait( &p->available, &p->lock );
+        pthread_mutex_lock( &p->lock);
+        pthread_cond_wait( &p->available, &p->lock );
+        pthread_mutex_unlock(&p->lock);  
     }
   }
-  pthread_mutex_unlock(&p->lock);  
   const kk_box_t result = kk_box_dup( p->result,ctx );
   kk_box_drop(pr,ctx);
   return result;
