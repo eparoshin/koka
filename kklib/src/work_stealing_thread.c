@@ -7,7 +7,7 @@
   found in the LICENSE file at the root of this distribution.
 ---------------------------------------------------------------------------*/
 #include "kklib.h"
-#include "kklib/thread.h"
+#include "kklib/work_stealing_thread.h"
 
 //TODO win
 
@@ -72,7 +72,7 @@ static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
     kk_box_dup(task->promise,ctx);
     kk_promise_set( task->promise, res, ctx );
   }
-  kk_task_free(task,ctx)
+  kk_task_free(task,ctx);
 }
 
 
@@ -80,107 +80,136 @@ static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
   task group (thread pool with task queue)
 ---------------------------------------------------------------------------*/
 
-typedef struct kk_task_group_s {
+// TODO(eparoshin) windows
+
+typedef struct parking_slot_s {
+    uint32_t epoch;
+} parking_slot_t;
+
+typedef enum kk_tg_type {
+    gq,
+    ws,
+} kk_tg_type_e;
+
+
+typedef struct kk_task_group_gq {
   bool            done;
   kk_task_t*      tasks;
   kk_task_t*      tasks_tail;
-  pthread_cond_t  tasks_available;
   pthread_mutex_t tasks_lock;
   pthread_t*      threads;
-  kk_ssize_t      thread_count;
+} kk_task_group_gq_t;
+
+typedef struct kk_task_group_ws_s {
+  kk_task_group_gq_t gq;
+
+
+} kk_task_group_ws_t;
+
+typedef struct kk_task_group_s {
+    kk_tg_type_e type;
+    union {
+        kk_task_group_ws_t ws;
+        kk_task_group_gq_t gq;
+    };
 } kk_task_group_t;
 
 enum constants {
-    kk_num_local_tasks = 1024,
     dvyukov_const = 61,
     num_lifo_pushes = 5,
 };
 
-typedef kk_local_tasks = _Atomic(kk_task_t*)[kk_num_local_tasks];
-
 // SPMC ring buffer
 typedef struct kk_local_queue_s {
-    kk_local_tasks      tasks;
-    kk_task_t*          lifo_slot;
-    kk_ssize_t          num_lifo;
-    kk_ssize_t          gqueue_counter;
-    _Atomic(kk_ssize_t) head;
-    _Atomic(kk_ssize_t) tail;
-};
+    kk_ssize_t    gqueue_counter;
+    kk_ws_queue_t* lq;
+} kk_local_queue_t;
 
-__thread kk_local_queue_s* local_queue = NULL;
+typedef enum push_strategy {
+    push_lifo,
+    push_global,
+    uptoyou,
+} push_strategy_e;
 
-static void kk_local_queue_init(void) {
+__thread kk_local_queue_t* local_queue = NULL;
+
+static void kk_local_queue_init(kk_context_t* ctx) {
+    kk_assert(local_queue == NULL);
+    local_queue = kk_zalloc(sizeof(kk_local_queue_t), ctx);
+    local_queue->lq = kk_ws_queue_alloc(fifo, ctx);
 }
 
-static void kk_local_queue_free() {
+static void kk_local_queue_free(kk_context_t* ctx) {
+    kk_assert(local_queue != NULL);
+    kk_ws_queue_free(local_queue->lq, ctx);
+    kk_free(local_queue, ctx);
+    local_queue = NULL;
 }
 
-static bool kk_try_push( kk_local_queue_s* q,  kk_task_t* task, bool lifo ) {
-
-}
-
-static kk_task_t* kk_try_pop( kk_local_queue_s* q) {
-
-}
-
-static kk_size_t kk_try_grab( kk_local_queue_s* q, kk_task_t* tasks, kk_ssize_t sz ) {
-
-}
-
-static kk_size_t kk_space_lower_bound ( kk_local_queue_s* q ) {
-
-}
-
-static bool kk_tasks_is_empty( kk_task_group_t* tg ) {
-  return (tg->tasks == NULL);
-}
-
-static kk_task_t* kk_tasks_dequeue( kk_task_group_t* tg ) {
-  kk_task_t* task = tg->tasks;
-  if (task != NULL) {
-    tg->tasks = task->next;
-    if (tg->tasks == NULL) { 
-      kk_assert(tg->tasks_tail == task);
-      tg->tasks_tail = NULL; 
-    }
-  }
-  kk_assert(task != NULL || tg->done);
-  return task;
-}
-
-static void kk_tasks_enqueue_n( kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, kk_context_t*  ctx ) {
-  kk_unused(ctx);
-  if (tg->tasks_tail != NULL) {
-    kk_assert(tg->tasks_tail->next == NULL);
+static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, kk_context_t* ctx) {
+    ttail->next = NULL;
+    pthread_mutex_lock(&tg->tasks_lock);
     tg->tasks_tail->next = thead;
-  }
-  else {
-    tg->tasks = thead;
-  }
-  tg->tasks_tail = ttail;
+    tg->tasks_tail = ttail;
+    pthread_mutex_unlock(&tg->tasks_lock);
+
 }
 
-static void kk_tasks_enqueue( kk_task_group_t* tg, kk_task_t* task, kk_context_t* ctx ) {
-  kk_tasks_enqueue_n( tg, task, task, ctx );
+static void kk_enqueue_global(kk_task_group_t* tg, kk_task_t* task, kk_context_t* ctx) {
+    kk_enqueue_n_global(tg, task, task, ctx);
 }
 
-static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t fun, kk_context_t* ctx ) {
+static void kk_notify_push( kk_task_group_t* tg, kk_context_t* ctx) {
+}
+
+static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool lifo, kk_context_t* ctx) {
+    (void)lifo; //todo
+    return kk_ws_queue_put(q->lq, task);
+}
+
+static kk_task_t* kk_try_pop( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
+}
+
+static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool lifo, kk_context_t* ctx) {
+    kk_local_queue_t* lq = local_queue;
+    //sometimes we need to push to global queue even for local tasks
+    if (++lq->gqueue_counter == dvyukov_const) {
+        lq->gqueue_counter = 0;
+        kk_enqueue_global(tg, task, ctx);
+        return;
+    }
+
+    if (!kk_try_push(lq, task, lifo, ctx)) {
+        //try push failed
+        //offload 1/2 tasks to global queue
+        kk_task_t* tasks_buff[queue_size / 2];
+        size_t num_grabbed = kk_ws_queue_grab(lq->lq, (uintptr_t*)tasks_buff);
+        kk_task_t* thead = task;
+        kk_task_t* ttail = task;
+        for (size_t i = 0; i < num_grabbed; ++i) {
+            ttail->next = tasks_buff[i];
+            ttail = tasks_buff[i];
+        }
+        kk_enqueue_n_global(tg, thead, ttail, ctx);
+    }
+}
+
+
+static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t fun, enum push_strategy strategy, kk_context_t* ctx ) {
   kk_promise_t p = kk_promise_alloc(ctx);
   kk_task_t* task = kk_task_alloc(fun, kk_box_dup(p,ctx), ctx);
 
-  kk_local_queue_s* lq = local_queue;
-
-  ll_assert(lq != NULL);
-
-  if (kk_try_push( lq, task, false /*TODO*/)) {
-      return p;
+  switch (strategy) {
+      case push_lifo:
+      case uptoyou:
+          kk_enqueue_local(tg, task, strategy == push_lifo, ctx);
+      case push_global:
+          kk_enqueue_global(tg, task, ctx);
+          break;
   }
 
-  pthread_mutex_lock(&tg->tasks_lock);
-  kk_tasks_enqueue(tg,task,ctx);
-  pthread_mutex_unlock(&tg->tasks_lock);
-  pthread_cond_signal(&tg->tasks_available);  
+  kk_notify_push(tg, ctx);
+
   return p;
 }
 
@@ -210,7 +239,7 @@ static void* kk_task_group_worker( void* vtg ) {
 
 
 void kk_task_group_free( kk_task_group_t* tg, kk_context_t* ctx ) {
-  if (tg==NULL) return;  
+  if (tg==NULL) return;
   // set done state
   kk_task_t* task = NULL;
   tg->done = true;

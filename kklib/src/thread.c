@@ -498,7 +498,7 @@ static void kk_lvar_free( void* lvar, kk_block_t* b, kk_context_t* ctx ) {
   kk_unused(b);
   lvar_t* lv = (lvar_t*)(lvar);
   pthread_cond_destroy(&lv->available);
-  pthread_mutex_destroy(&lv->lock);  
+  pthread_mutex_destroy(&lv->lock);
   kk_box_drop(lv->result,ctx);
   kk_free(lv,ctx);
 }
@@ -559,7 +559,7 @@ kk_box_t kk_lvar_get( kk_lvar_t lvar, kk_box_t bot, kk_function_t is_gte, kk_con
       // run task
       if (task != NULL) { 
         kk_task_exec(task, ctx);
-        pthread_mutex_lock(&lv->lock);        
+        pthread_mutex_lock(&lv->lock);
       }
       else {
         pthread_mutex_lock(&lv->lock);
@@ -581,7 +581,7 @@ kk_box_t kk_lvar_get( kk_lvar_t lvar, kk_box_t bot, kk_function_t is_gte, kk_con
             pthread_mutex_lock(&lv->lock); 
           }
         }
-        */        
+        */
       }
     }
     // if in the main thread do a blocking wait
