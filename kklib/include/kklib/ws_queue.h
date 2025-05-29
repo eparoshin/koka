@@ -33,8 +33,9 @@ kk_decl_export kk_ws_queue_t* kk_ws_queue_alloc(kk_ws_queue_type_e type, kk_cont
 kk_decl_export void kk_ws_queue_free(const kk_ws_queue_t* q, kk_context_t* ctx);
 
 kk_decl_export bool kk_ws_queue_put(kk_ws_queue_t* q, void* task);
+kk_decl_export void kk_ws_queue_put_many(kk_ws_queue_t* q, uintptr_t* tasks, size_t sz);
 kk_decl_export void* kk_ws_queue_pop(kk_ws_queue_t* q);
-kk_decl_export size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to);
+kk_decl_export size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to, uintptr_t* out_task);
 kk_decl_export size_t kk_ws_queue_grab(kk_ws_queue_t* q, uintptr_t* out);
 
 #endif //include guard

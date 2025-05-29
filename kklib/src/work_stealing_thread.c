@@ -25,6 +25,7 @@ static void pthread_join_void(pthread_t thread) {
 
 typedef struct promise_s {
   kk_box_t        result;
+  kk_atomic(bool) is_set;
   pthread_mutex_t lock;
   pthread_cond_t  available;
 } promise_t;
@@ -132,7 +133,10 @@ typedef struct kk_task_group_s {
   kk_atomic(bool) done;
   kk_task_t*      tasks;
   kk_task_t*      tasks_tail;
+  size_t          num_tasks;
   pthread_mutex_t tasks_lock;
+  kk_atomic(size_t) active_workers;
+  pthread_cond_t  workers_finished;
   kk_atomic(size_t) state;
   pthread_mutex_t idle_lock;
   parking_slot_t idle_head;
@@ -157,6 +161,20 @@ static void incr_idle(kk_task_group_t* tg) {
 
 static void decr_idle(kk_task_group_t* tg) {
     kk_atomic_sub_seq_cst(&tg->state, 1ull << 32);
+}
+
+static bool wake_worker(kk_task_group_t* tg) {
+    pthread_mutex_lock(&tg->idle_lock);
+    if (tg->idle_head.next != &tg->idle_head) { //non empty
+        parking_slot_t* worker = tg->idle_head.next;
+        tg->idle_head.next = tg->idle_head.next->next;
+        wake(worker);
+        decr_idle(tg);
+        pthread_mutex_unlock(&tg->idle_lock);
+        return true;
+    }
+    pthread_mutex_unlock(&tg->idle_lock);
+    return false;
 }
 
 static void become_inactive(kk_task_group_t* tg, parking_slot_t* ps) {
@@ -193,20 +211,36 @@ static void kk_local_queue_free(kk_local_queue_t* lq, kk_context_t* ctx) {
     kk_ws_queue_free(lq->lq, ctx);
 }
 
-static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, kk_context_t* ctx) {
+static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, size_t num_tasks, kk_context_t* ctx) {
     ttail->next = NULL;
     pthread_mutex_lock(&tg->tasks_lock);
+    if (tg->tasks_tail == NULL) {
+        tg->tasks = thead;
+        tg->tasks_tail = ttail;
+        tg->num_tasks = num_tasks;
+        ttail->next = NULL;
+        return;
+    }
+
     tg->tasks_tail->next = thead;
     tg->tasks_tail = ttail;
+    tg->num_tasks += num_tasks;
     pthread_mutex_unlock(&tg->tasks_lock);
 
 }
 
 static void kk_enqueue_global(kk_task_group_t* tg, kk_task_t* task, kk_context_t* ctx) {
-    kk_enqueue_n_global(tg, task, task, ctx);
+    kk_enqueue_n_global(tg, task, task, 1, ctx);
 }
 
 static void kk_notify_push( kk_task_group_t* tg, kk_context_t* ctx) {
+    (void)ctx;
+    size_t state = kk_atomic_load_seq_cst(&tg->state);
+    size_t num_idle = state >> 32;
+    size_t num_spinning = (state << 32) >> 32;
+    if (num_idle > 0 && num_spinning == 0) {
+        wake_worker(tg);
+    }
 }
 
 static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool lifo, kk_context_t* ctx) {
@@ -214,17 +248,110 @@ static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool lifo, kk_co
     return kk_ws_queue_put(q->lq, task);
 }
 
+static kk_task_t* pop_global_locked( kk_task_group_t* tg, kk_context_t* ctx) {
+    if (tg->num_tasks == 0) {
+        return nullptr;
+    }
+
+    --tg->num_tasks;
+    kk_task_t* task = tg->tasks;
+    tg->tasks = tg->tasks->next;
+    if (tg->num_tasks == 0) {
+        tg->tasks_tail = NULL;
+    }
+    return task;
+}
+
 
 static kk_task_t* kk_try_grab_global( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
+    pthread_mutex_lock(&tg->tasks_lock);
+    size_t num_to_grab = tg->workers_count <= 1 ? tg->num_tasks : (tg->num_tasks + tg->workers_count / 2 - 1) / (tg->workers_count / 2);
+    kk_task_t* tasks[queue_size];
+    size_t grabbed = num_to_grab;
+    for (size_t i = 0; i < num_to_grab; ++i) {
+        kk_task_t* task = pop_global_locked( tg, ctx );
+        if (task == NULL) {
+            grabbed = i;
+            break;
+        }
+        tasks[i] = task;
+    }
+    pthread_mutex_unlock(&tg->tasks_lock);
+    if (grabbed == 0) {
+        return NULL;
+    }
+    kk_task_t* task = tasks[grabbed - 1];
+    --grabbed;
+    kk_ws_queue_put_many(q->lq, (uintptr_t*)tasks, grabbed);
+
+    return task;
 }
 
 static kk_task_t* kk_try_pop_local( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
+    return (kk_task_t*)kk_ws_queue_pop(q->lq);
 }
 
 static kk_task_t* kk_try_pop_global( kk_task_group_t* tg, kk_context_t* ctx) {
+    pthread_mutex_lock(&tg->tasks_lock);
+    kk_task_t* task = pop_global_locked( tg, ctx );
+    pthread_mutex_unlock(&tg->tasks_lock);
+    return task;
+}
+
+static kk_task_t* try_steal_tasks(kk_task_group_t* tg, kk_local_queue_t* lq, size_t num_tries, kk_context_t* ctx) {
+    kk_task_t* task = NULL;
+    for (size_t i = 0; i < num_tries; ++i) {
+        size_t idx = kk_srandom_uint64(ctx) % tg->workers_count;
+        kk_local_queue_t* sq = &tg->workers[idx].lq;
+        //dont steal from myself
+        if (sq == ctx->local_queue) {
+            --idx;
+            continue;
+        }
+
+        size_t num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, (uintptr_t*)&task);
+        if (num_stolen > 0) {
+            break;
+        }
+    }
+    return task;
 }
 
 static kk_task_t* kk_try_pop_before_park( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
+    kk_task_t* task = NULL;
+    if ((task = kk_try_pop_global(tg, ctx))) {
+        return task;
+    }
+    if ((task = try_steal_tasks(tg, lq, 1, ctx))) {
+        return task;
+    }
+    return task;
+}
+
+
+static bool try_start_spinning(kk_task_group_t* tg) {
+    while (true) {
+        size_t state = kk_atomic_load_seq_cst(&tg->state);
+        size_t num_spinning = (state << 32) >> 32;
+        //do not allow more then 1/2 workers to spin
+        if (num_spinning + 1 > tg->workers_count / 2) {
+            return false;
+        }
+
+        size_t new_state = state + 1;
+
+        if (kk_atomic_cas_weak_seq_cst(&tg->state, &state, new_state)) {
+            return true;
+        }
+    }
+}
+
+//returns
+//was this worker last spinner?
+static bool stop_spinning(kk_task_group_t* tg) {
+    size_t prev_state = kk_atomic_dec_seq_cst(&tg->state);
+    size_t num_spinning = (prev_state << 32) >> 32;
+    return num_spinning == 1;
 }
 
 static kk_task_t* kk_try_pop( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
@@ -244,6 +371,19 @@ static kk_task_t* kk_try_pop( kk_task_group_t* tg, kk_local_queue_t* lq, kk_cont
     if ((task = kk_try_grab_global(tg, lq, ctx))) {
         return task;
     }
+
+    if (try_start_spinning(tg)) {
+        task = try_steal_tasks(tg, lq, 4, ctx);
+        bool last = stop_spinning(tg);
+        if (task && last) {
+            //found task
+            //last spinner must wake new worker
+            wake_worker(tg);
+        }
+        return task;
+    }
+
+    return nullptr;
 }
 
 static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
@@ -270,6 +410,8 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
         try_park(&lq->ps, epoch);
 
     }
+
+    return nullptr;
 }
 
 static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool lifo, kk_context_t* ctx) {
@@ -286,17 +428,18 @@ static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool lifo, k
             ttail->next = tasks_buff[i];
             ttail = tasks_buff[i];
         }
-        kk_enqueue_n_global(tg, thead, ttail, ctx);
+        kk_enqueue_n_global(tg, thead, ttail, num_grabbed, ctx);
     }
 }
 
 
-static kk_promise_t kk_task_group_schedule( kk_function_t fun, enum push_strategy strategy, kk_context_t* ctx ) {
-  kk_task_group_t* tg = ctx->task_group;
-  kk_assert(tg != NULL);
+static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t fun, enum push_strategy strategy, kk_context_t* ctx ) {
   kk_promise_t p = kk_promise_alloc(ctx);
   kk_task_t* task = kk_task_alloc(fun, kk_box_dup(p,ctx), ctx);
-
+  //external schedule
+  if (ctx->local_queue == NULL) {
+      strategy = push_global;
+  }
   switch (strategy) {
       case push_lifo:
       case uptoyou:
@@ -323,7 +466,7 @@ static void* kk_task_group_worker( void* vargs ) {
   ctx->task_group = tg;
   kk_local_queue_t* lq = &tg->workers[args->idx].lq;
   ctx->local_queue = lq;
-
+  kk_atomic_inc_seq_cst(&tg->active_workers);
   while(true) {
      // deqeue task
      kk_task_t* task = NULL;
@@ -338,37 +481,37 @@ static void* kk_task_group_worker( void* vargs ) {
   ctx->task_group = NULL;
   kk_free(vargs, ctx);
   kk_free_context();
+  size_t prev = kk_atomic_dec_seq_cst(&tg->active_workers);
   return NULL;
 }
 
 
 void kk_task_group_free( kk_task_group_t* tg, kk_context_t* ctx ) {
   if (tg==NULL) return;
-  // set done state
   kk_task_t* task = NULL;
-  tg->done = true;
+  kk_atomic_store_release(&tg->done, true);
   pthread_mutex_lock(&tg->tasks_lock);
   task = tg->tasks;
   tg->tasks = NULL;
   tg->tasks_tail = NULL;
-  tg->done = true;
   pthread_mutex_unlock(&tg->tasks_lock);
   // free tasks
   while( task != NULL ) {
     kk_task_t* next = task->next;
     kk_task_free(task,ctx);
-    task = next;  
+    task = next;
   }
-  // stop threads
-  pthread_cond_broadcast(&tg->tasks_available);  // pretend there are tasks to make the threads exit;
-  for( kk_ssize_t i = 0; i < tg->thread_count; i++) {
-    if (tg->threads[i] != 0) {
-      pthread_join_void(tg->threads[i]);
+
+  while (wake_worker(tg)) {}
+  for( kk_ssize_t i = 0; i < tg->workers_count; i++) {
+    if (tg->workers[i].thread != 0) {
+      pthread_join_void(tg->workers[i].thread);
     }
   }
-  pthread_cond_destroy(&tg->tasks_available);
+  pthread_cond_destroy(&tg->workers_finished);
   pthread_mutex_destroy(&tg->tasks_lock);
-  kk_free(tg->threads,ctx);
+  pthread_mutex_destroy(&tg->idle_lock);
+  kk_free(tg->workers,ctx);
   kk_free(tg,ctx);
 }
 
@@ -397,6 +540,7 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
   tg->tasks_tail = NULL;
   tg->idle_head.next = &tg->idle_head;
   tg->idle_head.prev = &tg->idle_head;
+  if (pthread_cond_init(&tg->workers_finished, NULL) != 0) goto err;
   if (pthread_mutex_init(&tg->tasks_lock, NULL) != 0) goto err;
   if (pthread_mutex_init(&tg->idle_lock, NULL) != 0) goto err;
   for (kk_ssize_t i = 0; i < tg->workers_count; i++) {
@@ -433,10 +577,8 @@ kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
                                                          // overhead for checking on every schedule
   kk_assert(task_group != NULL);
   kk_block_mark_shared( kk_datatype_as_ptr(fun,ctx), ctx);  // mark everything reachable from the task as shared
-  if (ctx->task_group == NULL) { 
-    ctx->task_group = task_group; // let main thread participate instead of blocking on a promise.get
-  }
-  return kk_task_group_schedule( fun, uptoyou, ctx );
+  kk_task_group_t* tg = ctx->task_group;
+  return kk_task_group_schedule( tg, fun, uptoyou, ctx );
 }
 
 
@@ -476,6 +618,7 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   pthread_mutex_lock(&p->lock);
   kk_box_drop(p->result,ctx);
   p->result = r;
+  kk_atomic_store_release(&p->is_set, true);
   pthread_mutex_unlock(&p->lock);
   pthread_cond_signal(&p->available);
   kk_box_drop(pr,ctx);
@@ -494,174 +637,27 @@ static bool kk_promise_available( kk_promise_t pr, kk_context_t* ctx ) {
 
 kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {  
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr,ctx);
-  pthread_mutex_lock(&p->lock);
-  while (kk_box_is_any(p->result)) {
+  while (!kk_atomic_load_acquire(&p->is_set)) {
     // if part of a task group, run other tasks while waiting
     if (ctx->task_group != NULL) {
-      pthread_mutex_unlock(&p->lock);
-      // try to get a task
       kk_task_group_t* tg = ctx->task_group;
-      kk_task_t* task = NULL;
-      pthread_mutex_lock(&tg->tasks_lock);
-      if (!kk_tasks_is_empty(tg) && !tg->done) {
-        task = kk_tasks_dequeue(tg);
+      kk_local_queue_t* lq = ctx->local_queue;
+      kk_assert(ctx->local_queue != NULL);
+      ++lq->gqueue_counter;
+      kk_task_t* task = kk_try_pop(tg, lq, ctx);
+      if (task == NULL) {
+          continue;
       }
-      pthread_mutex_unlock(&tg->tasks_lock);
-      // run task
-      if (task != NULL) { 
-        kk_task_exec(task, ctx);
-        pthread_mutex_lock(&p->lock);        
-      }
-      else {        
-        pthread_mutex_lock(&p->lock);
-        if (kk_box_is_any(p->result)) {
-          pthread_cond_wait( &p->available, &p->lock);
-        }
-        /*
-        // no task, block for a while
-        struct timespec tm;
-        clock_gettime(CLOCK_REALTIME, &tm);
-        tm.tv_nsec     +=  100000000;  // 0.1s
-        if (tm.tv_nsec >= 1000000000) {
-          tm.tv_nsec   -= 1000000000;
-          tm.tv_sec += 1;
-        }
-        pthread_mutex_lock(&p->lock);
-        if (kk_box_is_any(p->result)) {
-          if (pthread_cond_timedwait( &p->available, &p->lock, &tm) == ETIMEDOUT) {
-            pthread_mutex_lock(&p->lock); 
-          }
-        }
-        */        
-      }
+      kk_task_exec(task, ctx);
     }
     // if in the main thread do a blocking wait
     else {
+      pthread_mutex_lock( &p->lock);
       pthread_cond_wait( &p->available, &p->lock );
     }
   }
   pthread_mutex_unlock(&p->lock);  
   const kk_box_t result = kk_box_dup( p->result,ctx );
   kk_box_drop(pr,ctx);
-  return result;
-}
-
-
-/*---------------------------------------------------------------------------
-   Lvar
----------------------------------------------------------------------------*/
-
-typedef struct lvar_s {
-  kk_box_t        result;
-  pthread_mutex_t lock;
-  pthread_cond_t  available;
-} lvar_t;
-
-typedef kk_box_t kk_lvar_t;
-
-kk_lvar_t kk_lvar_alloc( kk_box_t init, kk_context_t* ctx );
-void      kk_lvar_put( kk_lvar_t lvar, kk_box_t val, kk_function_t monotonic_combine, kk_context_t* ctx );
-kk_box_t  kk_lvar_get( kk_lvar_t lvar, kk_box_t bot, kk_function_t is_gte, kk_context_t* ctx );
-
-
-static void kk_lvar_free( void* lvar, kk_block_t* b, kk_context_t* ctx ) {
-  kk_unused(b);
-  lvar_t* lv = (lvar_t*)(lvar);
-  pthread_cond_destroy(&lv->available);
-  pthread_mutex_destroy(&lv->lock);  
-  kk_box_drop(lv->result,ctx);
-  kk_free(lv,ctx);
-}
-
-kk_lvar_t kk_lvar_alloc(kk_box_t init, kk_context_t* ctx) {
-  kk_lvar_t lvar;
-  lvar_t* lv = (lvar_t*)kk_zalloc(kk_ssizeof(lvar_t),ctx);
-  if (lv == NULL) goto err;
-  lv->result = init;
-  if (pthread_mutex_init(&lv->lock, NULL) != 0) goto err;
-  if (pthread_cond_init(&lv->available, NULL) != 0) goto err;
-  lvar = kk_cptr_raw_box( &kk_lvar_free, lv, ctx );
-  kk_box_mark_shared(init,ctx);
-  kk_box_mark_shared(lvar,ctx);
-  return lvar;
-err:
-  kk_free(lv,ctx);
-  kk_box_drop(init,ctx);
-  return kk_box_any(ctx);
-}
-
-
-void kk_lvar_put( kk_lvar_t lvar, kk_box_t val, kk_function_t monotonic_combine, kk_context_t* ctx ) {
-  lvar_t* lv = (lvar_t*)kk_cptr_raw_unbox_borrowed(lvar,ctx);
-  pthread_mutex_lock(&lv->lock);
-  lv->result = kk_function_call(kk_box_t,(kk_function_t,kk_box_t,kk_box_t,kk_context_t*),monotonic_combine,(monotonic_combine,val,lv->result,ctx),ctx);
-  kk_box_mark_shared(lv->result,ctx);  // todo: can we mark outside the mutex?
-  pthread_mutex_unlock(&lv->lock);
-  pthread_cond_signal(&lv->available);
-  kk_box_drop(lvar,ctx);
-}
-
-
-kk_box_t kk_lvar_get( kk_lvar_t lvar, kk_box_t bot, kk_function_t is_gte, kk_context_t* ctx ) {
-  lvar_t* lv = (lvar_t*)kk_cptr_raw_unbox_borrowed(lvar,ctx);
-  kk_box_t result;
-  pthread_mutex_lock(&lv->lock);
-  while (true) {
-    kk_function_dup(is_gte,ctx);
-    kk_box_dup(lv->result,ctx);
-    kk_box_dup(bot,ctx);
-    int32_t done = kk_function_call(int32_t,(kk_function_t,kk_box_t,kk_box_t,kk_context_t*),is_gte,(is_gte,lv->result,bot,ctx),ctx);
-    if (done != 0) {
-      result = kk_box_dup(lv->result,ctx);
-      break;
-    }
-    // if part of a task group, run other tasks while waiting
-    if (ctx->task_group != NULL) {
-      pthread_mutex_unlock(&lv->lock);
-      // try to get a task
-      kk_task_group_t* tg = ctx->task_group;
-      kk_task_t* task = NULL;
-      pthread_mutex_lock(&tg->tasks_lock);
-      if (!kk_tasks_is_empty(tg) && !tg->done) {
-        task = kk_tasks_dequeue(tg);
-      }
-      pthread_mutex_unlock(&tg->tasks_lock);
-      // run task
-      if (task != NULL) { 
-        kk_task_exec(task, ctx);
-        pthread_mutex_lock(&lv->lock);        
-      }
-      else {
-        pthread_mutex_lock(&lv->lock);
-        if (kk_box_is_any(lv->result)) {
-          pthread_cond_wait( &lv->available, &lv->lock);
-        }
-        /*
-        // no task, block for a while
-        struct timespec tm;
-        clock_gettime(CLOCK_REALTIME, &tm);
-        tm.tv_nsec     +=  100000000;  // 0.1s
-        if (tm.tv_nsec >= 1000000000) {
-          tm.tv_nsec   -= 1000000000;
-          tm.tv_sec += 1;
-        }
-        pthread_mutex_lock(&lv->lock);
-        if (kk_box_is_any(lv->result)) {
-          if (pthread_cond_timedwait( &lv->available, &lv->lock, &tm) == ETIMEDOUT) {
-            pthread_mutex_lock(&lv->lock); 
-          }
-        }
-        */        
-      }
-    }
-    // if in the main thread do a blocking wait
-    else {
-      pthread_cond_wait( &lv->available, &lv->lock );
-    }
-  }
-  pthread_mutex_unlock(&lv->lock);  
-  kk_box_drop(bot,ctx);
-  kk_function_drop(is_gte,ctx);
-  kk_box_drop(lvar,ctx);
   return result;
 }

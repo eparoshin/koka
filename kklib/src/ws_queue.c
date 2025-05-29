@@ -67,6 +67,17 @@ void kk_ws_queue_force_put_many_fifo(kk_ws_queue_fifo_t* q, uintptr_t* tasks, si
     kk_atomic_store_release(&q->tail, tail + sz);
 }
 
+void kk_ws_queue_put_many(kk_ws_queue_t* q, uintptr_t* tasks, size_t sz) {
+    switch(q->type) {
+        case lifo:
+            kk_assert(false);
+            break;
+        case fifo:
+            kk_ws_queue_force_put_many_fifo(q, tasks, sz);
+            break;
+    }
+}
+
 void* kk_ws_queue_pop_fifo(kk_ws_queue_fifo_t* q) {
     for (;;) {
         size_t head = kk_atomic_load_acquire(&q->head); //maybe relaxed is enough
@@ -129,20 +140,24 @@ size_t kk_ws_queue_grab(kk_ws_queue_t* q, uintptr_t* out) {
     }
 }
 
-size_t kk_ws_queue_steal_fifo(kk_ws_queue_fifo_t* from, kk_ws_queue_fifo_t* to) {
+size_t kk_ws_queue_steal_fifo(kk_ws_queue_fifo_t* from, kk_ws_queue_fifo_t* to, uintptr_t* out_task) {
     //to is empty
     uintptr_t out[queue_size / 2];
     size_t num_stolen = kk_ws_queue_grab_fifo(from, out);
-    kk_ws_queue_force_put_many_fifo(to, out, num_stolen);
+    if (num_stolen == 0) {
+        return 0;
+    }
+    *out_task = out[num_stolen - 1];
+    kk_ws_queue_force_put_many_fifo(to, out, num_stolen - 1);
     return num_stolen;
 }
 
-size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to) {
+size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to, uintptr_t* out_task) {
     kk_assert(from->type == to->type);
     switch(from->type) {
         case lifo:
             kk_assert(false);
         case fifo:
-            return kk_ws_queue_steal_fifo(&from->fifo_q, &to->fifo_q);
+            return kk_ws_queue_steal_fifo(&from->fifo_q, &to->fifo_q, out_task);
     }
 }

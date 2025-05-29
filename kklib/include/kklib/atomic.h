@@ -40,8 +40,10 @@
 
 #define kk_atomic_fence_acquire()           kk_atomic(thread_fence)(kk_memory_order(acquire))
 
+#define kk_atomic_cas_weak_seq_cst(p,exp,des)   kk_atomic(compare_exchange_weak_explicit)(p,exp,des,kk_memory_order(seq_cst),kk_memory_order(seq_cst))
 #define kk_atomic_cas_weak_relaxed(p,exp,des)   kk_atomic(compare_exchange_weak_explicit)(p,exp,des,kk_memory_order(relaxed),kk_memory_order(relaxed))
 #define kk_atomic_cas_weak_acq_rel(p,exp,des)   kk_atomic(compare_exchange_weak_explicit)(p,exp,des,kk_memory_order(acq_rel),kk_memory_order(acquire))
+#define kk_atomic_cas_strong_seq_cst(p,exp,des)   kk_atomic(compare_exchange_strong_explicit)(p,exp,des,kk_memory_order(seq_cst),kk_memory_order(seq_cst))
 #define kk_atomic_cas_strong_relaxed(p,exp,des) kk_atomic(compare_exchange_strong_explicit)(p,exp,des,kk_memory_order(relaxed),kk_memory_order(relaxed))
 #define kk_atomic_cas_strong_acq_rel(p,exp,des) kk_atomic(compare_exchange_strong_explicit)(p,exp,des,kk_memory_order(acq_rel),kk_memory_order(acquire))
 
