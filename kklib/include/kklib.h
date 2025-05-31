@@ -1,6 +1,7 @@
 ﻿#pragma once
 #ifndef KKLIB_H
 #define KKLIB_H
+#undef KK_MIMALLOC
 /*---------------------------------------------------------------------------
   Copyright 2020-2022, Microsoft Research, Daan Leijen.
 

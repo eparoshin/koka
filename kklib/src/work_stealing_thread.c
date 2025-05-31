@@ -555,6 +555,7 @@ static void* kk_task_group_worker( void* vargs ) {
 
 
 void kk_task_group_free( kk_task_group_t* tg, kk_context_t* ctx ) {
+  return;
   if (tg==NULL) return;
   kk_task_t* task = NULL;
   kk_atomic_store_release(&tg->done, true);
@@ -699,7 +700,7 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
   kk_box_mark_shared(r,ctx);
   pthread_mutex_lock(&p->lock);
-  //kk_box_drop(p->result,ctx);
+  kk_box_drop(p->result,ctx);
   p->result = r;
   kk_atomic_store_seq_cst(&p->is_set, true);
   pthread_mutex_unlock(&p->lock);
@@ -711,7 +712,7 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   }
   */
   pthread_cond_broadcast(&p->available);
-  //kk_box_drop(pr,ctx);
+  kk_box_drop(pr,ctx);
 }
 
 /*
@@ -751,6 +752,6 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
     }
   }
   const kk_box_t result = kk_box_dup( p->result,ctx );
-  //kk_box_drop(pr,ctx);
+  kk_box_drop(pr,ctx);
   return result;
 }
