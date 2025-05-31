@@ -90,7 +90,10 @@ fun make( depth : int ) : div tree
   // make-trmc-fbip( Down( depth), Root )
   // make-fbip(Down(depth), Top)
   // make-down( depth, Top )
- FBIP in action: use a visitor to run the checksum tail-recursively
+
+
+
+// FBIP in action: use a visitor to run the checksum tail-recursively
 type visit  
   Done
   NodeR( right : tree, v : visit )
