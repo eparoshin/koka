@@ -304,6 +304,9 @@ static kk_task_t* kk_try_grab_global( kk_task_group_t* tg, kk_local_queue_t* q, 
     pthread_mutex_lock(&tg->tasks_lock);
     size_t num_to_grab = tg->workers_count <= 1 ? tg->num_tasks : (tg->num_tasks + tg->workers_count / 2 - 1) / (tg->workers_count / 2);
     kk_task_t* tasks[queue_size];
+    if (queue_size < num_to_grab) {
+        num_to_grab = queue_size;
+    }
     size_t grabbed = num_to_grab;
     for (size_t i = 0; i < num_to_grab; ++i) {
         kk_task_t* task = pop_global_locked( tg, ctx );
@@ -615,7 +618,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(0,kk_get_context());
+  task_group = kk_task_group_alloc(4,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
@@ -708,7 +711,7 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
     while (!kk_atomic_load_acquire(&p->is_set)) {
         pthread_mutex_lock( &p->lock);
         pthread_cond_wait( &p->available, &p->lock );
-        pthread_mutex_unlock(&p->lock);  
+        pthread_mutex_unlock(&p->lock);
     }
   }
   const kk_box_t result = kk_box_dup( p->result,ctx );
