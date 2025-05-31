@@ -46,6 +46,7 @@ typedef struct kk_task_s {
   struct kk_task_s* next;
   kk_function_t     fun;
   kk_promise_t      promise;
+  kk_atomic(size_t)  executed;
 } kk_task_t;
 
 static void kk_task_free( kk_task_t* task, kk_context_t* ctx ) {
@@ -68,8 +69,9 @@ static kk_task_t* kk_task_alloc( kk_function_t fun, kk_promise_t p, kk_context_t
 }
 
 static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
+  kk_assert(kk_atomic_inc_relaxed(&task->executed) == 0);
   if (!kk_function_is_null(task->fun,ctx)) {
-    kk_function_dup(task->fun,ctx);      
+    kk_function_dup(task->fun,ctx);
     kk_box_t res = kk_function_call(kk_box_t,(kk_function_t,kk_context_t*),task->fun,(task->fun,ctx),ctx);
     kk_box_dup(task->promise,ctx);
     kk_promise_set( task->promise, res, ctx );
@@ -165,11 +167,19 @@ static void decr_idle(kk_task_group_t* tg) {
     kk_atomic_sub_seq_cst(&tg->state, 1ull << 32);
 }
 
+static void unlink_node(parking_slot_t* ps) {
+    kk_assert(ps->next != NULL && ps->prev != NULL);
+    ps->next->prev = ps->prev;
+    ps->prev->next = ps->next;
+    ps->next = NULL;
+    ps->prev = NULL;
+}
+
 static bool wake_worker(kk_task_group_t* tg) {
     pthread_mutex_lock(&tg->idle_lock);
     if (tg->idle_head.next != &tg->idle_head) { //non empty
         parking_slot_t* worker = tg->idle_head.next;
-        tg->idle_head.next = tg->idle_head.next->next;
+        unlink_node(worker);
         wake(worker);
         decr_idle(tg);
         pthread_mutex_unlock(&tg->idle_lock);
@@ -179,6 +189,7 @@ static bool wake_worker(kk_task_group_t* tg) {
     return false;
 }
 
+/*
 static bool wake_worker_locked(kk_task_group_t* tg) {
     if (tg->idle_head.next != &tg->idle_head) { //non empty
         parking_slot_t* worker = tg->idle_head.next;
@@ -211,26 +222,27 @@ static bool wake_the_worker(kk_local_queue_t* lq) {
     pthread_mutex_unlock(&tg->idle_lock);
     return false;
 }
+*/
 
 static void become_inactive(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_lock(&tg->idle_lock);
-    ps->prev = &tg->idle_head;
-    ps->next = tg->idle_head.next;
-    tg->idle_head.next = ps;
+    kk_assert(ps->next == NULL && ps->prev == NULL);
+    ps->prev = tg->idle_head.prev;
+    ps->prev->next = ps;
+    ps->next = &tg->idle_head;
+    tg->idle_head.prev = ps;
     incr_idle(tg);
     pthread_mutex_unlock(&tg->idle_lock);
 }
 
+
 static void become_active(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_lock(&tg->idle_lock);
     if (ps->next == NULL && ps->prev == NULL) {
+        pthread_mutex_unlock(&tg->idle_lock);
         return;
     }
-    kk_assert(ps->next != NULL && ps->prev != NULL);
-    ps->prev->next = ps->next;
-    ps->next->prev = ps->prev;
-    ps->next = NULL;
-    ps->prev = NULL;
+    unlink_node(ps);
     decr_idle(tg);
     pthread_mutex_unlock(&tg->idle_lock);
 }
@@ -506,6 +518,11 @@ struct kk_worker_args_s {
     size_t idx;
 };
 
+
+static pthread_mutex_t worker_init_m;
+static pthread_cond_t worker_init_c;
+static size_t init_workers;
+
 static void* kk_task_group_worker( void* vargs ) {
   struct kk_worker_args_s* args = (struct kk_worker_args_s*)vargs;
   kk_task_group_t* tg = args->tg;
@@ -514,6 +531,10 @@ static void* kk_task_group_worker( void* vargs ) {
   kk_local_queue_t* lq = &tg->workers[args->idx].lq;
   ctx->local_queue = lq;
   kk_atomic_inc_seq_cst(&tg->active_workers);
+  pthread_mutex_lock(&worker_init_m);
+  ++init_workers;
+  pthread_mutex_unlock(&worker_init_m);
+  pthread_cond_broadcast(&worker_init_c);
   while(true) {
      // deqeue task
      kk_task_t* task = NULL;
@@ -587,6 +608,9 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
   tg->tasks_tail = NULL;
   tg->idle_head.next = &tg->idle_head;
   tg->idle_head.prev = &tg->idle_head;
+  if (pthread_cond_init(&worker_init_c, NULL) != 0) goto err;
+  if (pthread_mutex_init(&worker_init_m, NULL) != 0) goto err;
+  init_workers = 0;
   if (pthread_cond_init(&tg->workers_finished, NULL) != 0) goto err;
   if (pthread_mutex_init(&tg->tasks_lock, NULL) != 0) goto err;
   if (pthread_mutex_init(&tg->idle_lock, NULL) != 0) goto err;
@@ -600,6 +624,16 @@ static kk_task_group_t* kk_task_group_alloc( kk_ssize_t thread_cnt, kk_context_t
     if (pthread_create(&tg->workers[i].thread, NULL, &kk_task_group_worker, args) != 0) {
       goto err_threads;
     };
+  }
+  while (true) {
+      pthread_mutex_lock(&worker_init_m);
+      size_t cur_val = init_workers;
+      if (cur_val == tg->workers_count) {
+          pthread_mutex_unlock(&worker_init_m);
+          break;
+      }
+      pthread_cond_wait(&worker_init_c, &worker_init_m);
+      pthread_mutex_unlock(&worker_init_m);
   }
   return tg;
 
@@ -618,7 +652,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(4,kk_get_context());
+  task_group = kk_task_group_alloc(0,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
@@ -665,17 +699,19 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
   kk_box_mark_shared(r,ctx);
   pthread_mutex_lock(&p->lock);
-  kk_box_drop(p->result,ctx);
+  //kk_box_drop(p->result,ctx);
   p->result = r;
   kk_atomic_store_seq_cst(&p->is_set, true);
   pthread_mutex_unlock(&p->lock);
+  /*
   kk_local_queue_t* lq = (kk_local_queue_t*)kk_atomic_load_seq_cst(&p->lq);
   if (lq != NULL) {
-      wake_the_worker(lq);
+      //wake_the_worker(lq);
       //wake_all(lq->tg);
   }
-  pthread_cond_signal(&p->available);
-  kk_box_drop(pr,ctx);
+  */
+  pthread_cond_broadcast(&p->available);
+  //kk_box_drop(pr,ctx);
 }
 
 /*
@@ -715,6 +751,6 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
     }
   }
   const kk_box_t result = kk_box_dup( p->result,ctx );
-  kk_box_drop(pr,ctx);
+  //kk_box_drop(pr,ctx);
   return result;
 }
