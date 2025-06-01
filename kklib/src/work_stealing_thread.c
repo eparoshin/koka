@@ -727,7 +727,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(1,kk_get_context());
+  task_group = kk_task_group_alloc(0,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
@@ -815,7 +815,81 @@ static bool kk_promise_available( kk_promise_t pr, kk_context_t* ctx ) {
 }
 */
 
+/*
+typedef struct wait_all_cb_s {
+    kk_box_t result;
+    struct wait_all_cb_s* data;
+    size_t len;
+    kk_atomic(size_t)* cnt;
+    kk_promise_t p;
+} wait_all_cb_t;
+
+struct kk_std_core_types__list_s {
+  kk_block_t _block;
+};
+typedef kk_datatype_t kk_std_core_types__list;
+struct kk_std_core_types_Cons {
+  struct kk_std_core_types__list_s _base;
+  kk_box_t head;
+  kk_std_core_types__list tail;
+};
+
+ kk_std_core_types__list kk_std_core_types__new_Nil(kk_context_t* _ctx);
+ kk_std_core_types__list kk_std_core_types__new_Cons(kk_reuse_t _at, int32_t _cpath, kk_box_t head, kk_std_core_types__list tail, kk_context_t* _ctx);
+
+
+ kk_box_t kk_std_core_types__list_box(kk_std_core_types__list _x, kk_context_t* _ctx);
+
+static void wait_all_last(wait_all_cb_t* this) {
+  kk_context_t*    ctx = kk_get_context();
+  struct kk_std_core_types_Cons* cons = NULL;
+  kk_std_core_types__list list = kk_std_core_types__new_Nil(ctx);
+  wait_all_cb_t* data = this->data;
+  for (size_t i = 0; i < this->len; ++i) {
+    list = kk_std_core_types__new_Cons(kk_reuse_null,0,kk_box_dup(data[i].result,ctx), list, ctx);
+  }
+  kk_promise_set(this->p, kk_std_core_types__list_box(list, ctx), ctx);
+  kk_free(this->cnt, ctx);
+  kk_free(this->data, ctx);
+}
+
+static void wait_all_cb(void* vthis) {
+    wait_all_cb_t* this = (wait_all_cb_t*)vthis;
+    kk_assert(!kk_box_is_any(this->result));
+    size_t oldval = kk_atomic_inc_seq_cst(this->cnt);
+    if (oldval == this->len - 1) {
+        //was the last one
+        wait_all_last(this);
+    }
+}
+
+ struct kk_std_core_types_Cons* kk_std_core_types__as_Cons(kk_std_core_types__list x, kk_context_t* _ctx);
+ bool kk_std_core_types__is_Cons(kk_std_core_types__list x, kk_context_t* _ctx);
+
+
+ */
 kk_promise_t kk_promise_wait_all(kk_datatype_t lst, kk_context_t* ctx) {
+    /*
+  size_t len = 0;
+  kk_std_core_types__list xs = lst;
+  kk_std_core_types__list ys = xs;
+  while (kk_std_core_types__is_Cons(ys,ctx)) {
+    struct kk_std_core_types_Cons* cons = kk_std_core_types__as_Cons(ys,ctx);
+    len++;
+    ys = cons->tail;
+  }
+  kk_assert(len > 0);
+
+  kk_atomic(size_t)* cnt = kk_zalloc(sizeof(kk_atomic(size_t)), ctx);
+  wait_all_cb_t* cb_objs = kk_malloc(sizeof(wait_all_cb_t) * len, ctx);
+  for (size_t i = 0; i < len; ++i) {
+      cb_objs[i].data = cb_objs;
+      cb_objs[i].len = len;
+      cb_objs[i].cnt = cnt;
+
+  }
+  */
+
 }
 
 typedef struct transform_cb_s {
@@ -829,7 +903,7 @@ static void transform_cb(void* vthis) {
     kk_context_t*    ctx = kk_get_context();
     kk_box_t res = kk_box_dup(kk_function_call(kk_box_t,(kk_function_t,kk_box_t,kk_context_t*),this->fun,(this->fun,this->result,ctx),ctx), ctx);
     kk_promise_set( this->p, res, ctx);
-    //kk_free(this, ctx);
+    kk_free(this, ctx);
 }
 
 kk_promise_t kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_context_t* ctx) {
@@ -850,7 +924,7 @@ static void join_cb_inner(void* vthis) {
     join_cb_t* this = (join_cb_t*)vthis;
     kk_context_t*    ctx = kk_get_context();
     kk_promise_set(this->p, this->result, ctx);
-    //kk_free(this, ctx);
+    kk_free(this, ctx);
 }
 
 static void join_cb(void* vthis) {

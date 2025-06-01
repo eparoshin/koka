@@ -15,6 +15,8 @@ See ``test/bench/koka/binarytrees.kk`` for example usage.
 module std/os/task
 
 import std/num/int32
+import std/core/types
+import std/core/list
 
 // A `:promise<a>` can be `await`ed for a result.
 abstract struct promise<a>
