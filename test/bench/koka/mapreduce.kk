@@ -18,7 +18,7 @@ fun calconefn(n : int) : pure promise<int>
   task{ calcone(n) }
 
 fun calc(n : int) : pure int
-  val lst = list(0, 100)
+  val lst = list(0, 1000)
   foldl1(lst.map(calconefn).await, fn(i : int, j : int) if i < j then j else i)
 
 fun calcfn(n : int) : pure promise<int>

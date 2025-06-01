@@ -108,17 +108,28 @@ void futex_wake(uint32_t* value, uint32_t count) {
 }
 
 uint32_t prepare_park(parking_slot_t* slot) {
-    return kk_atomic_load_seq_cst(&slot->epoch);
+    return kk_atomic_load_seq_cst(&slot->epoch); //zero promise bit
 }
 
 void try_park(parking_slot_t* slot, uint32_t desired) {
-    futex_wait((uint32_t*)&slot->epoch, desired);
+    futex_wait((uint32_t*)&slot->epoch, desired); //can not park if promise bit set to one
 }
 
 void wake(parking_slot_t* slot) {
-    kk_atomic_inc_seq_cst(&slot->epoch);
+    kk_atomic_add_seq_cst(&slot->epoch, 2); //dont touch promise bit
     futex_wake((uint32_t*)&slot->epoch, -1);
 }
+
+
+//TODO macros
+void set_promise_bit_ps(parking_slot_t* ps, bool bit) {
+    if (bit) {
+        atomic_fetch_or(&ps->epoch, 0x1);
+    } else {
+        atomic_fetch_and(&ps->epoch, ~0x1);
+    }
+}
+
 
 // SPMC ring buffer
 typedef struct kk_local_queue_s {
@@ -127,6 +138,10 @@ typedef struct kk_local_queue_s {
     kk_ws_queue_t* lq;
     struct kk_task_group_s* tg;
 } kk_local_queue_t;
+
+void set_promise_bit(kk_local_queue_t* lq, bool bit) {
+    set_promise_bit_ps(&lq->ps, bit);
+}
 
 typedef struct kk_local_worker_s {
     kk_local_queue_t lq;
@@ -207,13 +222,13 @@ static void wake_all(kk_task_group_t* tg) {
     pthread_mutex_unlock(&tg->idle_lock);
 }
 
+*/
 static bool wake_the_worker(kk_local_queue_t* lq) {
     kk_task_group_t* tg = lq->tg;
     parking_slot_t* ps = &lq->ps;
     pthread_mutex_lock(&tg->idle_lock);
     if (ps->next != NULL && ps->prev != NULL) {
-        ps->next->prev = ps->prev;;
-        ps->prev->next = ps->next;;
+        unlink_node(ps);
         wake(ps);
         decr_idle(tg);
         pthread_mutex_unlock(&tg->idle_lock);
@@ -222,7 +237,6 @@ static bool wake_the_worker(kk_local_queue_t* lq) {
     pthread_mutex_unlock(&tg->idle_lock);
     return false;
 }
-*/
 
 static void become_inactive(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_lock(&tg->idle_lock);
@@ -465,7 +479,12 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
             return nullptr;
         }
 
+        if (epoch & 0x1) { //promise was set
+            become_active(tg, &lq->ps);
+            return nullptr;
+        }
         try_park(&lq->ps, epoch);
+        become_active(tg, &lq->ps);
 
     }
 
@@ -653,7 +672,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(0,kk_get_context());
+  task_group = kk_task_group_alloc(4,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
@@ -700,19 +719,17 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
   kk_box_mark_shared(r,ctx);
   pthread_mutex_lock(&p->lock);
-  kk_box_drop(p->result,ctx);
+  //kk_box_drop(p->result,ctx);
   p->result = r;
   kk_atomic_store_seq_cst(&p->is_set, true);
   pthread_mutex_unlock(&p->lock);
-  /*
   kk_local_queue_t* lq = (kk_local_queue_t*)kk_atomic_load_seq_cst(&p->lq);
   if (lq != NULL) {
-      //wake_the_worker(lq);
-      //wake_all(lq->tg);
+      set_promise_bit(lq, 1);
+      wake_the_worker(lq);
   }
-  */
   pthread_cond_broadcast(&p->available);
-  kk_box_drop(pr,ctx);
+  //kk_box_drop(pr,ctx);
 }
 
 /*
@@ -735,13 +752,14 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
       kk_atomic_store_seq_cst(&p->lq, (uintptr_t)lq);
   while (!kk_atomic_load_seq_cst(&p->is_set)) {
     // if part of a task group, run other tasks while waiting
-      ++lq->gqueue_counter;
-      kk_task_t* task = kk_pop(tg, lq, ctx);
+      kk_task_t* task = kk_try_pop(tg, lq, ctx);
       if (task == NULL) {
           continue;
       }
+      ++lq->gqueue_counter;
       kk_task_exec(task, ctx);
     }
+    set_promise_bit(lq, 0);
     }
     // if in the main thread do a blocking wait
     else {
@@ -749,9 +767,13 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
         pthread_mutex_lock( &p->lock);
         pthread_cond_wait( &p->available, &p->lock );
         pthread_mutex_unlock(&p->lock);
+        /*sleep(10);
+        if (!kk_atomic_load_acquire(&p->is_set)) {
+            exit(-1);
+        }*/
     }
   }
   const kk_box_t result = kk_box_dup( p->result,ctx );
-  kk_box_drop(pr,ctx);
+  //kk_box_drop(pr,ctx);
   return result;
 }
