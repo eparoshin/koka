@@ -20,11 +20,19 @@ import std/num/int32
 abstract struct promise<a>
   promise : any
 
+  
+
 noinline extern unsafe_task( work : () -> pure a ) : pure any
   c "kk_task_schedule"
 
 noinline extern unsafe_await( p : any ) : pure a
   c "kk_promise_get"
+
+noinline extern unsafe_make_promise( x : a ) : any
+  c "kk_make_promise"
+
+noinline extern unsafe_await_promise( cb : (a) -> ()) : ()
+  c "kk_await_promise"
 
 extern prim-task-set-default-concurrency( thread-count : ssize_t  ) : io ()
   c "kk_task_set_default_concurrency"
@@ -49,6 +57,21 @@ pub fun list/await( ps : list<promise<a>> ) : pure list<a>
 pub fun parallel( xs : list<() -> pure a> ) : pure list<a>
   xs.map( task ).await
 
+pub fun make_promise(x : a) : promise<a>
+  Promise( unsafe_make_promise(x) ))
+
+pub fun await_promise(cb : (a) -> ()) : pure promise<a>
+  unsafe_await_promise( cb )
+
+abstract effect coro
+  fun co_async( work : () -> pure a) : pure promise<a>
+  ctl co_await( p : promise<a>) : a
+
+pub fun default_coro(action : () -> <coro,pure|e> a) : <pure|e> promise<a>
+  handle action
+    return(x) make_promise(x)
+    fun co_async( work ) task ( work )
+    raw ctl co_await( p ) await_promise ( fn(res) rcontext.resume(res) )
 
 /*
 noinline extern unsafe_task_n( count : ssize_t, stride : ssize_t, work : () -> pure a, combine : (a,a) -> a ) : pure any
