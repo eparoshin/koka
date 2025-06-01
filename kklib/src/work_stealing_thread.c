@@ -25,14 +25,51 @@ static void pthread_join_void(pthread_t thread) {
 
 typedef void (promise_cb_t)(void*);
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 typedef struct promise_s {
   kk_box_t        result;
-  bool is_set;
-  pthread_mutex_t lock;
   promise_cb_t* cb;
   void* cb_this;
-  pthread_cond_t  available;
+  kk_atomic(uint) state;
 } promise_t;
+
+enum promise_states {
+    p_set = 1,
+    p_cb_set = 2,
+    p_wait_set = 4,
+};
+
+void futex_wait(uint32_t* value, uint32_t expected_value) {
+    syscall(SYS_futex, value, FUTEX_WAIT_PRIVATE, expected_value, nullptr, nullptr, 0);
+}
+
+// Wakeup 'count' threads sleeping on address of value (-1 wakes all)
+void futex_wake(uint32_t* value, uint32_t count) {
+    syscall(SYS_futex, value, FUTEX_WAKE_PRIVATE, count, nullptr, nullptr, 0);
+}
+
+uint32_t promise_set_result(promise_t* p) {
+    return kk_atomic_fetch_or_seq_cst(&p->state, p_set);
+}
+
+uint32_t promise_set_cb_flag(promise_t* p) {
+    return kk_atomic_fetch_or_seq_cst(&p->state, p_cb_set);
+}
+
+uint32_t promise_set_wait(promise_t* p) {
+    return kk_atomic_fetch_or_seq_cst(&p->state, p_wait_set);
+}
+
+void promise_wake(promise_t* p) {
+    futex_wake((uint32_t*)&p->state, -1);
+}
+
+void promise_wait(uint32_t prev, promise_t* p) {
+    futex_wait((uint32_t*)&p->state, (prev & (~p_set)));
+}
 
 
 static kk_promise_t kk_promise_alloc( kk_context_t* ctx );
@@ -145,9 +182,6 @@ static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
 
 // TODO(eparoshin) windows
 
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <unistd.h>
 
 typedef struct parking_slot_s {
     struct parking_slot_s* next;
@@ -157,14 +191,6 @@ typedef struct parking_slot_s {
 
 static_assert(sizeof(unsigned int) == 4, "");
 
-void futex_wait(uint32_t* value, uint32_t expected_value) {
-    syscall(SYS_futex, value, FUTEX_WAIT_PRIVATE, expected_value, nullptr, nullptr, 0);
-}
-
-// Wakeup 'count' threads sleeping on address of value (-1 wakes all)
-void futex_wake(uint32_t* value, uint32_t count) {
-    syscall(SYS_futex, value, FUTEX_WAKE_PRIVATE, count, nullptr, nullptr, 0);
-}
 
 uint32_t prepare_park(parking_slot_t* slot) {
     return kk_atomic_load_seq_cst(&slot->epoch);
@@ -765,8 +791,6 @@ kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
 static void kk_promise_free( void* vp, kk_block_t* b, kk_context_t* ctx ) {
   kk_unused(b);
   promise_t* p = (promise_t*)(vp);
-  pthread_cond_destroy(&p->available);
-  pthread_mutex_destroy(&p->lock);  
   kk_box_drop(p->result,ctx);
   kk_free(p,ctx);
 }
@@ -776,8 +800,6 @@ static kk_promise_t kk_promise_alloc(kk_context_t* ctx) {
   promise_t* p = (promise_t*)kk_zalloc(kk_ssizeof(promise_t),ctx);
   if (p == NULL) goto err;
   p->result = kk_box_any(ctx);
-  if (pthread_mutex_init(&p->lock, NULL) != 0) goto err;
-  if (pthread_cond_init(&p->available, NULL) != 0) goto err;
   pr = kk_cptr_raw_box( &kk_promise_free, p, ctx );
   kk_box_mark_shared(pr,ctx);
   return pr;
@@ -790,31 +812,35 @@ err:
 static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
   kk_box_mark_shared(r,ctx);
-  pthread_mutex_lock(&p->lock);
   //kk_box_drop(p->result,ctx);
   p->result = r;
-  if (p->cb) {
+  uint32_t prev_state = promise_set_result(p);
+  if (prev_state & p_cb_set) { //callback already set
+    kk_assert(p->cb);
+    kk_assert(p->cb_this);
     *(kk_box_t*)p->cb_this = kk_box_dup(p->result, ctx); //invariant - cb_this always starts with kk_box_t
     kk_task_t* task = kk_internal_task_alloc(p->cb_this, p->cb, ctx);
     kk_task_group_schedule(task_group, task, push_lifo, ctx);
   }
-  pthread_mutex_unlock(&p->lock);
-  pthread_cond_broadcast(&p->available);
+
+  if (prev_state & p_wait_set) {
+      promise_wake(p);
+  }
   //kk_box_drop(pr,ctx);
 }
 
 static void promise_set_cb( kk_promise_t pr, void* cb_this, promise_cb_t* cb, kk_context_t* ctx) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
-  pthread_mutex_lock(&p->lock);
-  if (kk_box_is_any(p->result)) { //no result yet
-    p->cb_this = cb_this;
-    p->cb = cb;
-  } else {
+  p->cb_this = cb_this;
+  p->cb = cb;
+
+  uint32_t prev_state = promise_set_cb_flag(p);
+  if (prev_state & p_set) {
+    kk_assert(!kk_box_is_any(p->result));
     *(kk_box_t*)cb_this = kk_box_dup(p->result, ctx); //invariant - cb_this always starts with kk_box_t
     kk_task_t* task = kk_internal_task_alloc(cb_this, cb, ctx);
     kk_task_group_schedule(task_group, task, push_lifo, ctx);
   }
-  pthread_mutex_unlock(&p->lock);
 }
 
 /*
@@ -959,13 +985,14 @@ kk_promise_t kk_promise_join(kk_promise_t pr, kk_context_t* ctx) {
 }
 
 
-kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {  
+kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr,ctx);
-    pthread_mutex_lock( &p->lock);
-    while (kk_box_is_any(p->result)) {
-        pthread_cond_wait( &p->available, &p->lock );
-        pthread_mutex_unlock(&p->lock);
-    }
+
+  uint32_t prev_state = promise_set_wait(p) | p_wait_set;
+  while (!(prev_state & p_set)) {
+      promise_wait(prev_state, p);
+      prev_state = kk_atomic_load_seq_cst(&p->state);
+  }
   const kk_box_t result = kk_box_dup( p->result,ctx );
   //kk_box_drop(pr,ctx);
   return result;

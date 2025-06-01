@@ -62,6 +62,8 @@
 #define kk_atomic_dec_relaxed(p)            kk_atomic_sub_relaxed(p,1)
 #define kk_atomic_dec_release(p)            kk_atomic_sub_release(p,1)
 
+#define kk_atomic_fetch_or_seq_cst(p,x)       kk_atomic(fetch_or_explicit)(p,x,kk_memory_order(seq_cst))
+
 
 
 #if defined(__cplusplus)
