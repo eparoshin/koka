@@ -167,40 +167,30 @@ void futex_wake(uint32_t* value, uint32_t count) {
 }
 
 uint32_t prepare_park(parking_slot_t* slot) {
-    return kk_atomic_load_seq_cst(&slot->epoch); //zero promise bit
+    return kk_atomic_load_seq_cst(&slot->epoch);
 }
 
 void try_park(parking_slot_t* slot, uint32_t desired) {
-    futex_wait((uint32_t*)&slot->epoch, desired); //can not park if promise bit set to one
+    futex_wait((uint32_t*)&slot->epoch, desired);
 }
 
 void wake(parking_slot_t* slot) {
-    kk_atomic_add_seq_cst(&slot->epoch, 2); //dont touch promise bit
+    kk_atomic_add_seq_cst(&slot->epoch, 1);
     futex_wake((uint32_t*)&slot->epoch, -1);
 }
 
-
-//TODO macros
-void set_promise_bit_ps(parking_slot_t* ps, bool bit) {
-    if (bit) {
-        atomic_fetch_or(&ps->epoch, 0x1);
-    } else {
-        atomic_fetch_and(&ps->epoch, ~0x1);
-    }
-}
 
 
 // SPMC ring buffer
 typedef struct kk_local_queue_s {
     parking_slot_t ps;
     kk_ssize_t    gqueue_counter;
+    kk_ssize_t lifo_counter;
     kk_ws_queue_t* lq;
+    kk_task_t* lifo;
     struct kk_task_group_s* tg;
 } kk_local_queue_t;
 
-void set_promise_bit(kk_local_queue_t* lq, bool bit) {
-    set_promise_bit_ps(&lq->ps, bit);
-}
 
 typedef struct kk_local_worker_s {
     kk_local_queue_t lq;
@@ -224,7 +214,7 @@ typedef struct kk_task_group_s {
 
 enum constants {
     dvyukov_const = 61,
-    num_lifo_pushes = 5,
+    num_lifo_pops = 5,
 };
 
 typedef enum push_strategy {
@@ -366,8 +356,16 @@ static void kk_notify_push( kk_task_group_t* tg, kk_context_t* ctx) {
 }
 
 static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool islifo, kk_context_t* ctx) {
-    (void)islifo; //todo
-    return kk_ws_queue_put(q->lq, task);
+    if (islifo) {
+        kk_task_t* lifo_task = q->lifo;
+        q->lifo = task;
+        if (lifo_task != NULL) {
+            return kk_ws_queue_put(q->lq, lifo_task);
+        }
+        return true;
+    } else {
+        return kk_ws_queue_put(q->lq, task);
+    }
 }
 
 static kk_task_t* pop_global_locked( kk_task_group_t* tg, kk_context_t* ctx) {
@@ -413,7 +411,26 @@ static kk_task_t* kk_try_grab_global( kk_task_group_t* tg, kk_local_queue_t* q, 
 }
 
 static kk_task_t* kk_try_pop_local( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
-    return (kk_task_t*)kk_ws_queue_pop(q->lq);
+    kk_task_t* task = NULL;
+    if (q->lifo) {
+        if (++q->lifo_counter % num_lifo_pops == 0) {
+            task = q->lifo;
+            q->lifo = NULL;
+        } else {
+            task = q->lifo;
+            q->lifo = NULL;
+            return task;
+        }
+    }
+
+    q->lifo_counter = 0;
+    kk_task_t* result = (kk_task_t*)kk_ws_queue_pop(q->lq);
+    if (task != NULL) {
+        bool pushed = kk_ws_queue_put(q->lq, task); //push previous lifo task
+        kk_assert(pushed); //we just popped one task, so must always work
+    }
+
+    return result;
 }
 
 static kk_task_t* kk_try_pop_global( kk_task_group_t* tg, kk_context_t* ctx) {
@@ -538,10 +555,6 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
             return nullptr;
         }
 
-        if (epoch & 0x1) { //promise was set
-            become_active(tg, &lq->ps);
-            return nullptr;
-        }
         try_park(&lq->ps, epoch);
         become_active(tg, &lq->ps);
 
