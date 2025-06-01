@@ -23,11 +23,14 @@ static void pthread_join_void(pthread_t thread) {
   Promise
 ---------------------------------------------------------------------------*/
 
+typedef void (promise_cb_t)(void*);
+
 typedef struct promise_s {
   kk_box_t        result;
-  kk_atomic(bool) is_set;
+  bool is_set;
   pthread_mutex_t lock;
-  kk_atomic(uintptr_t) lq;
+  promise_cb_t* cb;
+  void* cb_this;
   pthread_cond_t  available;
 } promise_t;
 
@@ -42,17 +45,57 @@ static void         kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* c
   cpu-bound task
 ---------------------------------------------------------------------------*/
 
-typedef struct kk_task_s {
-  struct kk_task_s* next;
+typedef struct kk_task_naitive_s {
   kk_function_t     fun;
   kk_promise_t      promise;
   kk_atomic(size_t)  executed;
+} kk_task_native_t;
+
+
+typedef void (task_cb_t)(void*);
+
+typedef struct kk_task_internal_s {
+    void* cb_this;
+    task_cb_t* cb;
+} kk_task_internal_t;
+
+enum task_type {
+   native_task,
+   internal_task
+};
+
+typedef struct kk_task_s {
+  enum task_type tt;
+  struct kk_task_s* next;
+  union {
+      kk_task_native_t nt;
+      kk_task_internal_t it;
+  };
+
 } kk_task_t;
 
 static void kk_task_free( kk_task_t* task, kk_context_t* ctx ) {
-  kk_function_drop(task->fun,ctx);
-  kk_box_drop(task->promise,ctx);
-  kk_free(task,ctx);
+    switch (task->tt) {
+        case native_task:
+            kk_function_drop(task->nt.fun,ctx);
+            kk_box_drop(task->nt.promise,ctx);
+            break;
+        case internal_task:
+            break;
+    }
+    kk_free(task,ctx);
+}
+
+static kk_task_t* kk_internal_task_alloc( void* cb_this, task_cb_t* cb, kk_context_t* ctx) {
+  kk_task_t* task = (kk_task_t*)kk_zalloc(kk_ssizeof(kk_task_t), ctx);
+  task->tt = internal_task;
+  if (task == NULL) {
+      return NULL;
+  }
+  task->next = NULL;
+  task->it.cb_this = cb_this;
+  task->it.cb = cb;
+  return task;
 }
 
 static kk_task_t* kk_task_alloc( kk_function_t fun, kk_promise_t p, kk_context_t* ctx ) {
@@ -62,19 +105,35 @@ static kk_task_t* kk_task_alloc( kk_function_t fun, kk_promise_t p, kk_context_t
     kk_box_drop(p,ctx);
     return NULL;
   }
-  task->promise = p;
-  task->fun  = fun;
+  task->tt = native_task;
+  task->nt.promise = p;
+  task->nt.fun  = fun;
   task->next = NULL;
   return task;
 }
 
-static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
-  kk_assert(kk_atomic_inc_relaxed(&task->executed) == 0);
+static void kk_native_task_exec( kk_task_native_t* task, kk_context_t* ctx ) {
   if (!kk_function_is_null(task->fun,ctx)) {
     kk_function_dup(task->fun,ctx);
     kk_box_t res = kk_function_call(kk_box_t,(kk_function_t,kk_context_t*),task->fun,(task->fun,ctx),ctx);
     kk_box_dup(task->promise,ctx);
     kk_promise_set( task->promise, res, ctx );
+  }
+}
+
+static void kk_internal_task_exec( kk_task_internal_t* task, kk_context_t* ctx ) {
+    kk_assert(task->cb_this && task->cb);
+    task->cb(task->cb_this);
+}
+
+static void kk_task_exec( kk_task_t* task, kk_context_t* ctx ) {
+  switch(task->tt) {
+      case native_task:
+          kk_native_task_exec(&task->nt, ctx);
+          break;
+      case internal_task:
+          kk_internal_task_exec(&task->it, ctx);
+          break;
   }
   kk_task_free(task,ctx);
 }
@@ -510,9 +569,7 @@ static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool islifo,
 }
 
 
-static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t fun, enum push_strategy strategy, kk_context_t* ctx ) {
-  kk_promise_t p = kk_promise_alloc(ctx);
-  kk_task_t* task = kk_task_alloc(fun, kk_box_dup(p,ctx), ctx);
+static void kk_task_group_schedule( kk_task_group_t* tg, kk_task_t* task, enum push_strategy strategy, kk_context_t* ctx ) {
   //external schedule
   if (ctx->local_queue == NULL) {
       strategy = push_global;
@@ -528,8 +585,6 @@ static kk_promise_t kk_task_group_schedule( kk_task_group_t* tg, kk_function_t f
   }
 
   kk_notify_push(tg, ctx);
-
-  return p;
 }
 
 struct kk_worker_args_s {
@@ -681,7 +736,11 @@ kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
   kk_assert(task_group != NULL);
   kk_block_mark_shared( kk_datatype_as_ptr(fun,ctx), ctx);  // mark everything reachable from the task as shared
   kk_task_group_t* tg = task_group;
-  return kk_task_group_schedule( tg, fun, uptoyou, ctx );
+  kk_promise_t p = kk_promise_alloc(ctx);
+  kk_task_t* task = kk_task_alloc(fun, kk_box_dup(p,ctx), ctx);
+
+  kk_task_group_schedule( tg, task, uptoyou, ctx );
+  return p;
 }
 
 
@@ -721,15 +780,28 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   pthread_mutex_lock(&p->lock);
   //kk_box_drop(p->result,ctx);
   p->result = r;
-  kk_atomic_store_seq_cst(&p->is_set, true);
-  pthread_mutex_unlock(&p->lock);
-  kk_local_queue_t* lq = (kk_local_queue_t*)kk_atomic_load_seq_cst(&p->lq);
-  if (lq != NULL) {
-      set_promise_bit(lq, 1);
-      wake_the_worker(lq);
+  if (p->cb) {
+    *(kk_box_t*)p->cb_this = kk_box_dup(p->result, ctx); //invariant - cb_this always starts with kk_box_t
+    kk_task_t* task = kk_internal_task_alloc(p->cb_this, p->cb, ctx);
+    kk_task_group_schedule(task_group, task, push_lifo, ctx);
   }
+  pthread_mutex_unlock(&p->lock);
   pthread_cond_broadcast(&p->available);
   //kk_box_drop(pr,ctx);
+}
+
+static void promise_set_cb( kk_promise_t pr, void* cb_this, promise_cb_t* cb, kk_context_t* ctx) {
+  promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
+  pthread_mutex_lock(&p->lock);
+  if (kk_box_is_any(p->result)) { //no result yet
+    p->cb_this = cb_this;
+    p->cb = cb;
+  } else {
+    *(kk_box_t*)cb_this = kk_box_dup(p->result, ctx); //invariant - cb_this always starts with kk_box_t
+    kk_task_t* task = kk_internal_task_alloc(cb_this, cb, ctx);
+    kk_task_group_schedule(task_group, task, push_lifo, ctx);
+  }
+  pthread_mutex_unlock(&p->lock);
 }
 
 /*
@@ -743,36 +815,69 @@ static bool kk_promise_available( kk_promise_t pr, kk_context_t* ctx ) {
 }
 */
 
+kk_promise_t     kk_promise_wait_all (kk_datatype_t lst, kk_context_t* ctx) {}
+
+typedef struct transform_cb_s {
+  kk_box_t result;
+  kk_function_t fun;
+  kk_promise_t p;
+} transform_cb_t;
+
+static void transform_cb(void* vthis) {
+    transform_cb_t* this = (transform_cb_t*)vthis;
+    kk_context_t*    ctx = kk_get_context();
+    kk_box_t res = kk_function_call(kk_box_t,(kk_function_t,kk_box_t,kk_context_t*),this->fun,(this->fun,this->result,ctx),ctx);
+    kk_promise_set( this->p, res, ctx);
+    kk_free(this, ctx);
+}
+
+kk_promise_t kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_context_t* ctx) {
+    kk_promise_t p = kk_promise_alloc(ctx);
+    transform_cb_t* cb_this = kk_zalloc(sizeof(transform_cb_t), ctx);
+    cb_this->fun = fun;
+    cb_this->p = kk_box_dup(p, ctx); //TODO maybe no dup
+    promise_set_cb(pr, cb_this, &transform_cb, ctx);
+    return p;
+}
+
+typedef struct join_cb_s {
+    kk_box_t result;
+    kk_promise_t p;
+} join_cb_t;
+
+static void join_cb_inner(void* vthis) {
+    join_cb_t* this = (join_cb_t*)vthis;
+    kk_context_t*    ctx = kk_get_context();
+    kk_promise_set(this->p, this->result, ctx);
+    kk_free(this, ctx);
+}
+
+static void join_cb(void* vthis) {
+    join_cb_t* this = (join_cb_t*)vthis;
+    //todo unbox promise
+    //tried it, looks like it works
+    kk_assert(!kk_box_is_any(this->result));
+    kk_promise_t inner_promise = this->result;
+    kk_context_t*    ctx = kk_get_context();
+    promise_set_cb(inner_promise, this, &join_cb_inner, ctx);
+}
+
+kk_promise_t kk_promise_join(kk_promise_t pr, kk_context_t* ctx) {
+    kk_promise_t p = kk_promise_alloc(ctx);
+    join_cb_t* cb_this = kk_zalloc(sizeof(join_cb_t), ctx);
+    cb_this->p = kk_box_dup(p, ctx);
+    promise_set_cb(pr, cb_this, &join_cb, ctx);
+    return p;
+}
+
+
 kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {  
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr,ctx);
-    if (ctx->task_group != NULL) {
-      kk_task_group_t* tg = ctx->task_group;
-      kk_local_queue_t* lq = ctx->local_queue;
-      kk_assert(ctx->local_queue != NULL);
-      kk_atomic_store_seq_cst(&p->lq, (uintptr_t)lq);
-  while (!kk_atomic_load_seq_cst(&p->is_set)) {
-    // if part of a task group, run other tasks while waiting
-      kk_task_t* task = kk_try_pop(tg, lq, ctx);
-      if (task == NULL) {
-          continue;
-      }
-      ++lq->gqueue_counter;
-      kk_task_exec(task, ctx);
-    }
-    set_promise_bit(lq, 0);
-    }
-    // if in the main thread do a blocking wait
-    else {
-    while (!kk_atomic_load_acquire(&p->is_set)) {
-        pthread_mutex_lock( &p->lock);
+    pthread_mutex_lock( &p->lock);
+    while (kk_box_is_any(p->result)) {
         pthread_cond_wait( &p->available, &p->lock );
         pthread_mutex_unlock(&p->lock);
-        /*sleep(10);
-        if (!kk_atomic_load_acquire(&p->is_set)) {
-            exit(-1);
-        }*/
     }
-  }
   const kk_box_t result = kk_box_dup( p->result,ctx );
   //kk_box_drop(pr,ctx);
   return result;

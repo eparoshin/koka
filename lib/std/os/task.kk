@@ -20,26 +20,26 @@ import std/num/int32
 abstract struct promise<a>
   promise : any
 
-  
-
 noinline extern unsafe_task( work : () -> pure a ) : pure any
   c "kk_task_schedule"
 
 noinline extern unsafe_await( p : any ) : pure a
   c "kk_promise_get"
 
-noinline extern unsafe_make_promise( x : a ) : any
-  c "kk_make_promise"
+noinline extern unsafe_wait_all( ps : list<promise<a>> ) : any
+  c "kk_promise_wait_all"
 
-noinline extern unsafe_await_promise( cb : (a) -> ()) : ()
-  c "kk_await_promise"
+noinline extern unsafe_transform(p : any, f : (a) -> pure b) : pure any
+  c "kk_promise_transform"
+
+noinline extern unsafe_join(p : any) : pure any
+  c "kk_promise_join"
 
 extern prim-task-set-default-concurrency( thread-count : ssize_t  ) : io ()
   c "kk_task_set_default_concurrency"
 
 pub fun task-set-default-concurrency( thread-count : int ) : io ()
   prim-task-set-default-concurrency( thread-count.ssize_t )
-
 
 // Spark a pure computation in a separate thread of control.
 pub noinline fun task( work : () -> pure a ) : pure promise<a>
@@ -49,6 +49,15 @@ pub noinline fun task( work : () -> pure a ) : pure promise<a>
 pub fun await( p : promise<a> ) : pure a
   unsafe_await( p.promise )
 
+pub fun wait_all( ps : list<promise<a>> ) : pure promise<list<a>>
+  Promise(unsafe_wait_all( ps ))
+
+pub fun transform(p : promise<a>, f : (a) -> pure b) : pure promise<b>
+  Promise(unsafe_transform(p.promise, f))
+
+pub fun join(p : promise<promise<a>>) : pure promise<a>
+  Promise(unsafe_join(p.promise))
+
 // Await the result of a list of promises.
 pub fun list/await( ps : list<promise<a>> ) : pure list<a>
   ps.map(await)
@@ -56,22 +65,6 @@ pub fun list/await( ps : list<promise<a>> ) : pure list<a>
 // Run a list of pure computations in parallel.
 pub fun parallel( xs : list<() -> pure a> ) : pure list<a>
   xs.map( task ).await
-
-pub fun make_promise(x : a) : promise<a>
-  Promise( unsafe_make_promise(x) ))
-
-pub fun await_promise(cb : (a) -> ()) : pure promise<a>
-  unsafe_await_promise( cb )
-
-abstract effect coro
-  fun co_async( work : () -> pure a) : pure promise<a>
-  ctl co_await( p : promise<a>) : a
-
-pub fun default_coro(action : () -> <coro,pure|e> a) : <pure|e> promise<a>
-  handle action
-    return(x) make_promise(x)
-    fun co_async( work ) task ( work )
-    raw ctl co_await( p ) await_promise ( fn(res) rcontext.resume(res) )
 
 /*
 noinline extern unsafe_task_n( count : ssize_t, stride : ssize_t, work : () -> pure a, combine : (a,a) -> a ) : pure any
@@ -108,4 +101,3 @@ pub fun put( lvar : lvar<a>, x : a, monotonic-combine : (a,a) -> a ) : pure ()
 pub fun get( lvar : lvar<a>, bot : a, is-gte: (a,a) -> bool ) : pure a
   unsafe-get( lvar.lv, bot, fn(x,y){ if (is-gte(x,y)) then one else zero } )
 
-  */

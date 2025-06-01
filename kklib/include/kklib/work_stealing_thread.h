@@ -16,6 +16,9 @@
 typedef kk_box_t  kk_promise_t;
 
 kk_decl_export kk_box_t     kk_promise_get( kk_promise_t pr, kk_context_t* ctx );
+kk_decl_export kk_promise_t     kk_promise_wait_all (kk_datatype_t lst, kk_context_t* ctx);
+kk_decl_export kk_promise_t     kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_context_t* ctx);
+kk_decl_export kk_promise_t     kk_promise_join (kk_promise_t pr, kk_context_t* ctx);
 
 /*--------------------------------------------------------------------------------------
    Tasks
