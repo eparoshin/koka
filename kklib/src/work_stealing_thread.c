@@ -727,7 +727,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(4,kk_get_context());
+  task_group = kk_task_group_alloc(1,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
@@ -815,7 +815,8 @@ static bool kk_promise_available( kk_promise_t pr, kk_context_t* ctx ) {
 }
 */
 
-kk_promise_t     kk_promise_wait_all (kk_datatype_t lst, kk_context_t* ctx) {}
+kk_promise_t kk_promise_wait_all(kk_datatype_t lst, kk_context_t* ctx) {
+}
 
 typedef struct transform_cb_s {
   kk_box_t result;
@@ -828,7 +829,7 @@ static void transform_cb(void* vthis) {
     kk_context_t*    ctx = kk_get_context();
     kk_box_t res = kk_function_call(kk_box_t,(kk_function_t,kk_box_t,kk_context_t*),this->fun,(this->fun,this->result,ctx),ctx);
     kk_promise_set( this->p, res, ctx);
-    kk_free(this, ctx);
+    //kk_free(this, ctx);
 }
 
 kk_promise_t kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_context_t* ctx) {
@@ -849,7 +850,7 @@ static void join_cb_inner(void* vthis) {
     join_cb_t* this = (join_cb_t*)vthis;
     kk_context_t*    ctx = kk_get_context();
     kk_promise_set(this->p, this->result, ctx);
-    kk_free(this, ctx);
+    //kk_free(this, ctx);
 }
 
 static void join_cb(void* vthis) {

@@ -17,10 +17,10 @@ fun calconefn(n : int) : pure promise<int>
   task{ calcone(n) }
 
 fun calc(n : int) : pure promise<int>
-  list(0, 1000).map(calconefn).wait_all.transform(fn(l) foldl1(l, fn(i : int, j : int) if i < j then j else i))
+  list(0, 30).map(calconefn).wait_all.transform(fn(l) foldl1(l, fn(i : int, j : int) if i < j then j else i))
 
 
 pub fun main()
-  val lst = list(0, 100)
+  val lst = list(0, 30)
   val result = lst.map(calc).wait_all.transform(fn(l) foldl1(l, fn(i, j) if i < j then j else i)).await
   show(result)

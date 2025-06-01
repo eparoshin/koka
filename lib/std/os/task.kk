@@ -49,14 +49,20 @@ pub noinline fun task( work : () -> pure a ) : pure promise<a>
 pub fun await( p : promise<a> ) : pure a
   unsafe_await( p.promise )
 
-pub fun wait_all( ps : list<promise<a>> ) : pure promise<list<a>>
-  Promise(unsafe_wait_all( ps ))
 
 pub fun transform(p : promise<a>, f : (a) -> pure b) : pure promise<b>
   Promise(unsafe_transform(p.promise, f))
 
 pub fun join(p : promise<promise<a>>) : pure promise<a>
   Promise(unsafe_join(p.promise))
+
+fun transform_promise(head : promise<a>, tail : promise<list<a>>) : pure promise<list<a>>
+  head.transform(fn(h) tail.transform( fn(t) Cons(h, t) ) ).join
+
+pub fun wait_all( ps : list<promise<a>> ) : pure promise<list<a>>
+  //Promise(unsafe_wait_all( ps ))
+  val empty = task { Nil }
+  ps.foldr(empty, transform_promise)
 
 // Await the result of a list of promises.
 pub fun list/await( ps : list<promise<a>> ) : pure list<a>
