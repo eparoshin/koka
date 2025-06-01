@@ -827,7 +827,7 @@ typedef struct transform_cb_s {
 static void transform_cb(void* vthis) {
     transform_cb_t* this = (transform_cb_t*)vthis;
     kk_context_t*    ctx = kk_get_context();
-    kk_box_t res = kk_function_call(kk_box_t,(kk_function_t,kk_box_t,kk_context_t*),this->fun,(this->fun,this->result,ctx),ctx);
+    kk_box_t res = kk_box_dup(kk_function_call(kk_box_t,(kk_function_t,kk_box_t,kk_context_t*),this->fun,(this->fun,this->result,ctx),ctx), ctx);
     kk_promise_set( this->p, res, ctx);
     //kk_free(this, ctx);
 }
@@ -835,7 +835,7 @@ static void transform_cb(void* vthis) {
 kk_promise_t kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_context_t* ctx) {
     kk_promise_t p = kk_promise_alloc(ctx);
     transform_cb_t* cb_this = kk_zalloc(sizeof(transform_cb_t), ctx);
-    cb_this->fun = fun;
+    cb_this->fun = kk_function_dup(fun, ctx);
     cb_this->p = kk_box_dup(p, ctx); //TODO maybe no dup
     promise_set_cb(pr, cb_this, &transform_cb, ctx);
     return p;
@@ -858,8 +858,8 @@ static void join_cb(void* vthis) {
     //todo unbox promise
     //tried it, looks like it works
     kk_assert(!kk_box_is_any(this->result));
-    kk_promise_t inner_promise = this->result;
     kk_context_t*    ctx = kk_get_context();
+    kk_promise_t inner_promise = kk_box_dup(this->result, ctx);
     promise_set_cb(inner_promise, this, &join_cb_inner, ctx);
 }
 
