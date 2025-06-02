@@ -785,7 +785,7 @@ kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
 
 
 /*---------------------------------------------------------------------------
-  blocking promise
+  wait-free promise
 ---------------------------------------------------------------------------*/
 
 static void kk_promise_free( void* vp, kk_block_t* b, kk_context_t* ctx ) {
