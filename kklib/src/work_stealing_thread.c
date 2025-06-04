@@ -519,7 +519,8 @@ static kk_task_t* pop_global_locked( kk_task_group_t* tg, kk_context_t* ctx) {
 
 static kk_task_t* kk_try_grab_global( kk_task_group_t* tg, kk_local_queue_t* q, kk_context_t* ctx) {
     pthread_mutex_lock(&tg->tasks_lock);
-    size_t num_to_grab = tg->workers_count <= 1 ? tg->num_tasks : (tg->num_tasks + tg->workers_count / 2 - 1) / (tg->workers_count / 2);
+    //size_t num_to_grab = tg->workers_count <= 1 ? tg->num_tasks : (tg->num_tasks + tg->workers_count / 2 - 1) / (tg->workers_count / 2);
+    size_t num_to_grab = (tg->num_tasks + 5) / 6;
     kk_task_t* tasks[queue_size];
     if (queue_size < num_to_grab) {
         num_to_grab = queue_size;
@@ -590,25 +591,25 @@ static kk_task_t* kk_try_pop_global( kk_task_group_t* tg, kk_context_t* ctx) {
 
 static kk_task_t* try_steal_tasks(kk_task_group_t* tg, kk_local_queue_t* lq, size_t num_tries, kk_context_t* ctx) {
     kk_task_t* task = NULL;
+    size_t to_steal = queue_size / 2;
     for (size_t i = 0; i < num_tries; ++i) {
         size_t idx = kk_srandom_uint64(ctx) % tg->workers_count;
         for (size_t j = 0; j < tg->workers_count; ++j) {
             kk_local_queue_t* sq = &tg->workers[(j + idx) % tg->workers_count].lq;
-            kk_assert(sq);
-            kk_assert(lq);
             kk_assert(ctx->local_queue);
             //dont steal from myself
             if (sq == lq) {
                 continue;
             }
 
-            kk_assert(sq->lq);
-            kk_assert(lq->lq);
-            size_t num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, (uintptr_t*)&task);
-            if (num_stolen > 0) {
-                if (task != NULL) {
-                    set_source_type(task, stolen);
-                }
+            size_t num_stolen;
+            if (to_steal == queue_size / 2 ) {
+                num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, to_steal, (uintptr_t*)&task);
+            } else {
+                num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, to_steal, NULL);
+            }
+            to_steal -= num_stolen;
+            if (to_steal == 0) {
                 return task;
             }
         }
@@ -729,7 +730,7 @@ static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool islifo,
         //try push failed
         //offload 1/2 tasks to global queue
         kk_task_t* tasks_buff[queue_size / 2];
-        size_t num_grabbed = kk_ws_queue_grab(lq->lq, (uintptr_t*)tasks_buff);
+        size_t num_grabbed = kk_ws_queue_grab(lq->lq, queue_size / 2, (uintptr_t*)tasks_buff);
         kk_task_t* thead = overflow_task;
         kk_task_t* ttail = overflow_task;
         for (size_t i = 0; i < num_grabbed; ++i) {

@@ -105,7 +105,7 @@ void* kk_ws_queue_pop(kk_ws_queue_t* q) {
     return NULL;
 }
 
-size_t kk_ws_queue_grab_fifo(kk_ws_queue_fifo_t* q, uintptr_t* out) {
+size_t kk_ws_queue_grab_fifo(kk_ws_queue_fifo_t* q, size_t maxst, uintptr_t* out) {
     for (;;) {
         size_t head = kk_atomic_load_acquire(&q->head); //maybe relaxed is enough
         size_t tail = kk_atomic_load_acquire(&q->tail);
@@ -116,6 +116,11 @@ size_t kk_ws_queue_grab_fifo(kk_ws_queue_fifo_t* q, uintptr_t* out) {
             //inconsistent head and tail, retry
             continue;
         }
+
+        if (maxst < num_to_grab) {
+            num_to_grab = maxst;
+        }
+
 
         if (num_to_grab == 0) {
             return 0;
@@ -132,36 +137,39 @@ size_t kk_ws_queue_grab_fifo(kk_ws_queue_fifo_t* q, uintptr_t* out) {
 }
 
 //called by stealer, or by producer if queue is full
-size_t kk_ws_queue_grab(kk_ws_queue_t* q, uintptr_t* out) {
+size_t kk_ws_queue_grab(kk_ws_queue_t* q, size_t maxst, uintptr_t* out) {
     switch(q->type) {
         case lifo:
             kk_assert(false);
             break;
         case fifo:
-            return kk_ws_queue_grab_fifo(&q->fifo_q, out);
+            return kk_ws_queue_grab_fifo(&q->fifo_q, maxst, out);
     }
     return 0;
 }
 
-size_t kk_ws_queue_steal_fifo(kk_ws_queue_fifo_t* from, kk_ws_queue_fifo_t* to, uintptr_t* out_task) {
+size_t kk_ws_queue_steal_fifo(kk_ws_queue_fifo_t* from, kk_ws_queue_fifo_t* to, size_t maxst, uintptr_t* out_task) {
     //to is empty
     uintptr_t out[queue_size / 2];
-    size_t num_stolen = kk_ws_queue_grab_fifo(from, out);
+    size_t num_stolen = kk_ws_queue_grab_fifo(from, maxst, out);
     if (num_stolen == 0) {
         return 0;
     }
-    *out_task = out[num_stolen - 1];
-    kk_ws_queue_force_put_many_fifo(to, out, num_stolen - 1);
-    return num_stolen;
+    if (out_task) {
+        *out_task = out[num_stolen - 1];
+        --num_stolen;
+    }
+    kk_ws_queue_force_put_many_fifo(to, out, num_stolen);
+    return num_stolen + (out_task != NULL);
 }
 
-size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to, uintptr_t* out_task) {
+size_t kk_ws_queue_steal(kk_ws_queue_t* from, kk_ws_queue_t* to, size_t maxst, uintptr_t* out_task) {
     kk_assert(from->type == to->type);
     switch(from->type) {
         case lifo:
             kk_assert(false);
         case fifo:
-            return kk_ws_queue_steal_fifo(&from->fifo_q, &to->fifo_q, out_task);
+            return kk_ws_queue_steal_fifo(&from->fifo_q, &to->fifo_q, maxst, out_task);
     }
     return 0;
 }
