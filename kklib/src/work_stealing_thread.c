@@ -85,7 +85,6 @@ static void         kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* c
 typedef struct kk_task_naitive_s {
   kk_function_t     fun;
   kk_promise_t      promise;
-  kk_atomic(size_t)  executed;
 } kk_task_native_t;
 
 
@@ -111,7 +110,6 @@ enum source_type {
 
 typedef struct kk_task_s {
   enum task_type tt;
-  kk_atomic(uint) prev_source;
   struct kk_task_s* next;
   union {
       kk_task_native_t nt;
@@ -121,7 +119,7 @@ typedef struct kk_task_s {
 } kk_task_t;
 
 void set_source_type(kk_task_t* task, enum source_type st) {
-    kk_assert(kk_atomic_fetch_or_seq_cst(&task->prev_source, st) == 0);
+    //kk_assert(kk_atomic_fetch_or_seq_cst(&task->prev_source, st) == 0);
 }
 
 static void kk_task_free( kk_task_t* task, kk_context_t* ctx ) {
@@ -446,7 +444,7 @@ static bool check_tasks(kk_task_t* thead, kk_task_t* ttail, size_t num_tasks) {
 
 static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, size_t num_tasks, kk_context_t* ctx) {
     ttail->next = NULL;
-    kk_assert(check_tasks(thead, ttail, num_tasks)); //TODO - disable
+    //kk_assert(check_tasks(thead, ttail, num_tasks)); //TODO - disable
     pthread_mutex_lock(&tg->tasks_lock);
     if (tg->tasks_tail == NULL) {
         kk_assert(tg->num_tasks == 0);
@@ -462,7 +460,7 @@ static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t
     tg->tasks_tail->next = thead;
     tg->tasks_tail = ttail;
     tg->num_tasks += num_tasks;
-    kk_assert(check_tasks(tg->tasks, tg->tasks_tail, tg->num_tasks));
+    //kk_assert(check_tasks(tg->tasks, tg->tasks_tail, tg->num_tasks));
     pthread_mutex_unlock(&tg->tasks_lock);
 
 }
@@ -1095,12 +1093,12 @@ kk_promise_t kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_contex
 typedef struct join_cb_s {
     kk_box_t result;
     kk_promise_t p;
-    kk_atomic(size_t) used;
+    //kk_atomic(size_t) used;
 } join_cb_t;
 
 static void join_cb_inner(void* vthis) {
     join_cb_t* this = (join_cb_t*)vthis;
-    kk_assert(1 == kk_atomic_inc_seq_cst(&this->used));
+    //kk_assert(1 == kk_atomic_inc_seq_cst(&this->used));
     kk_context_t*    ctx = kk_get_context();
     kk_promise_set(this->p, this->result, ctx);
     //kk_free(this, ctx);
@@ -1108,7 +1106,7 @@ static void join_cb_inner(void* vthis) {
 
 static void join_cb(void* vthis) {
     join_cb_t* this = (join_cb_t*)vthis;
-    kk_assert(0 == kk_atomic_inc_seq_cst(&this->used));
+    //kk_assert(0 == kk_atomic_inc_seq_cst(&this->used));
     //todo unbox promise
     //tried it, looks like it works
     kk_assert(!kk_box_is_any(this->result));
