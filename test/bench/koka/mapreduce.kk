@@ -13,7 +13,7 @@ fun calconefn(n : int) : pure promise<int>
   task{ calcone(n) }.join
 
 fun calc(n : int) : pure promise<int>
-  list(0, 100000).map(calconefn).wait_all.transform(fn(l) foldl1(l, fn(i : int, j : int) if i < j then j else i))
+  list(0, 100).map(calconefn).wait_all.transform(fn(l) foldl1(l, fn(i : int, j : int) if i < j then j else i))
 
 
 pub fun main()

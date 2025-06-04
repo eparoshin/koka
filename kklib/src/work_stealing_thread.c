@@ -101,8 +101,17 @@ enum task_type {
    internal_task
 };
 
+enum source_type {
+    lifo_slot = 1,
+    local_queue = 2,
+    global_queue = 4,
+    stolen = 8,
+};
+
+
 typedef struct kk_task_s {
   enum task_type tt;
+  kk_atomic(uint) prev_source;
   struct kk_task_s* next;
   union {
       kk_task_native_t nt;
@@ -110,6 +119,10 @@ typedef struct kk_task_s {
   };
 
 } kk_task_t;
+
+void set_source_type(kk_task_t* task, enum source_type st) {
+    kk_assert(kk_atomic_fetch_or_seq_cst(&task->prev_source, st) == 0);
+}
 
 static void kk_task_free( kk_task_t* task, kk_context_t* ctx ) {
     switch (task->tt) {
@@ -120,7 +133,7 @@ static void kk_task_free( kk_task_t* task, kk_context_t* ctx ) {
         case internal_task:
             break;
     }
-    kk_free(task,ctx);
+    //kk_free(task,ctx);
 }
 
 static kk_task_t* kk_internal_task_alloc( void* cb_this, task_cb_t* cb, kk_context_t* ctx) {
@@ -187,10 +200,10 @@ typedef struct parking_slot_s {
     struct parking_slot_s* next;
     struct parking_slot_s* prev;
     kk_atomic(uint) epoch;
+    bool is_spinning;
 } parking_slot_t;
 
 static_assert(sizeof(unsigned int) == 4, "");
-
 
 uint32_t prepare_park(parking_slot_t* slot) {
     return kk_atomic_load_seq_cst(&slot->epoch);
@@ -232,6 +245,7 @@ typedef struct kk_task_group_s {
   kk_atomic(size_t) active_workers;
   pthread_cond_t  workers_finished;
   kk_atomic(size_t) state;
+  kk_atomic(bool) need_spinning;
   pthread_mutex_t idle_lock;
   parking_slot_t idle_head;
   kk_local_worker_t* workers;
@@ -248,6 +262,7 @@ typedef enum push_strategy {
     push_global,
     uptoyou,
 } push_strategy_e;
+
 
 static void incr_idle(kk_task_group_t* tg) {
     kk_atomic_add_seq_cst(&tg->state, 1ull << 32);
@@ -268,10 +283,25 @@ static void unlink_node(parking_slot_t* ps) {
 static bool wake_worker(kk_task_group_t* tg) {
     pthread_mutex_lock(&tg->idle_lock);
     if (tg->idle_head.next != &tg->idle_head) { //non empty
+        kk_atomic_inc_seq_cst(&tg->state); //wakeup spinning worker
         parking_slot_t* worker = tg->idle_head.next;
         unlink_node(worker);
-        wake(worker);
         decr_idle(tg);
+        wake(worker);
+        pthread_mutex_unlock(&tg->idle_lock);
+        return true;
+    }
+    pthread_mutex_unlock(&tg->idle_lock);
+    return false;
+}
+
+static bool wake_worker_no_inc(kk_task_group_t* tg) {
+    pthread_mutex_lock(&tg->idle_lock);
+    if (tg->idle_head.next != &tg->idle_head) { //non empty
+        parking_slot_t* worker = tg->idle_head.next;
+        unlink_node(worker);
+        decr_idle(tg);
+        wake(worker);
         pthread_mutex_unlock(&tg->idle_lock);
         return true;
     }
@@ -336,6 +366,61 @@ static void become_active(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_unlock(&tg->idle_lock);
 }
 
+void wake_if_last(kk_task_group_t* tg) {
+    size_t state = kk_atomic_load_seq_cst(&tg->state);
+    if ((state << 32) >> 32 != 0) {
+        //was not the last spinner
+        return;
+    }
+
+    //try to start spinning
+    while (!kk_atomic_cas_strong_seq_cst(&tg->state, &state, state + 1)) {
+        if ((state << 32) >> 32 != 0) {
+            return;
+        }
+    }
+
+    if (!wake_worker_no_inc(tg)) {
+        //no idle workers, but new tasks came
+        //if there is worker trying to go idle
+        //it must see the flag
+        kk_atomic_dec_seq_cst(&tg->state);
+        kk_atomic_store_seq_cst(&tg->need_spinning, true);
+    }
+
+
+}
+
+void become_spinning(kk_task_group_t* tg, parking_slot_t* ps) {
+    kk_assert(!ps->is_spinning);
+    ps->is_spinning = true;
+    kk_atomic_inc_seq_cst(&tg->state);
+    kk_atomic_store_seq_cst(&tg->need_spinning, false); //thread started spinning, so flag is not needed
+}
+
+bool try_become_spinning(kk_task_group_t* tg, parking_slot_t* ps) {
+    size_t state = kk_atomic_load_seq_cst(&tg->state);
+    size_t num_spinning = (state << 32) >> 32;
+    //do not allow more then 1/2 workers to spin
+    //it is not strict, but accurate enough
+    if (num_spinning + 1 > tg->workers_count / 2) {
+        return false;
+    }
+    become_spinning(tg, ps);
+    return true;
+
+}
+
+
+//wakes up another thread if it was the last spinning
+void reset_spinning(kk_task_group_t* tg, parking_slot_t* ps) {
+    kk_assert(ps->is_spinning);
+    ps->is_spinning = false;
+    kk_atomic_dec_seq_cst(&tg->state);
+    wake_if_last(tg);
+
+}
+
 static int kk_local_queue_init(kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
     lq->tg = tg;
     if ((lq->lq = kk_ws_queue_alloc(fifo, ctx)) == 0) {
@@ -348,10 +433,23 @@ static void kk_local_queue_free(kk_local_queue_t* lq, kk_context_t* ctx) {
     kk_ws_queue_free(lq->lq, ctx);
 }
 
+static bool check_tasks(kk_task_t* thead, kk_task_t* ttail, size_t num_tasks) {
+    kk_assert(ttail->next == NULL);
+    for (size_t i = 0; i + 1< num_tasks; ++i) {
+        kk_assert(thead);
+        thead = thead->next;
+    }
+    kk_assert(thead == ttail);
+    return true;
+}
+
 static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t* ttail, size_t num_tasks, kk_context_t* ctx) {
     ttail->next = NULL;
+    kk_assert(check_tasks(thead, ttail, num_tasks)); //TODO - disable
     pthread_mutex_lock(&tg->tasks_lock);
     if (tg->tasks_tail == NULL) {
+        kk_assert(tg->num_tasks == 0);
+        kk_assert(tg->tasks == NULL);
         tg->tasks = thead;
         tg->tasks_tail = ttail;
         tg->num_tasks = num_tasks;
@@ -363,6 +461,7 @@ static void kk_enqueue_n_global(kk_task_group_t* tg, kk_task_t* thead, kk_task_t
     tg->tasks_tail->next = thead;
     tg->tasks_tail = ttail;
     tg->num_tasks += num_tasks;
+    kk_assert(check_tasks(tg->tasks, tg->tasks_tail, tg->num_tasks));
     pthread_mutex_unlock(&tg->tasks_lock);
 
 }
@@ -381,21 +480,31 @@ static void kk_notify_push( kk_task_group_t* tg, kk_context_t* ctx) {
     }
 }
 
-static bool kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool islifo, kk_context_t* ctx) {
+static kk_task_t* kk_try_push( kk_local_queue_t* q,  kk_task_t* task, bool islifo, kk_context_t* ctx) {
     if (islifo) {
         kk_task_t* lifo_task = q->lifo;
         q->lifo = task;
         if (lifo_task != NULL) {
-            return kk_ws_queue_put(q->lq, lifo_task);
+            if (kk_ws_queue_put(q->lq, lifo_task)) {
+                return NULL;
+            } else {
+                return lifo_task;
+            }
         }
-        return true;
+        return NULL;
     } else {
-        return kk_ws_queue_put(q->lq, task);
+        if (kk_ws_queue_put(q->lq, task)) {
+            return NULL;
+        } else {
+            return task;
+        }
     }
 }
 
 static kk_task_t* pop_global_locked( kk_task_group_t* tg, kk_context_t* ctx) {
     if (tg->num_tasks == 0) {
+        kk_assert(tg->tasks == NULL);
+        kk_assert(tg->tasks_tail == NULL);
         return nullptr;
     }
 
@@ -433,6 +542,9 @@ static kk_task_t* kk_try_grab_global( kk_task_group_t* tg, kk_local_queue_t* q, 
     --grabbed;
     kk_ws_queue_put_many(q->lq, (uintptr_t*)tasks, grabbed);
 
+    if (task != NULL) {
+        set_source_type(task, global_queue);
+    }
     return task;
 }
 
@@ -444,6 +556,7 @@ static kk_task_t* kk_try_pop_local( kk_task_group_t* tg, kk_local_queue_t* q, kk
             q->lifo = NULL;
         } else {
             task = q->lifo;
+            set_source_type(task, lifo_slot);
             q->lifo = NULL;
             return task;
         }
@@ -451,17 +564,27 @@ static kk_task_t* kk_try_pop_local( kk_task_group_t* tg, kk_local_queue_t* q, kk
 
     q->lifo_counter = 0;
     kk_task_t* result = (kk_task_t*)kk_ws_queue_pop(q->lq);
+    if (result == NULL) { //q is empty, so return from lifo slot
+        if (task != NULL) {
+            set_source_type(task, lifo_slot);
+        }
+        return task;
+    }
     if (task != NULL) {
         bool pushed = kk_ws_queue_put(q->lq, task); //push previous lifo task
         kk_assert(pushed); //we just popped one task, so must always work
     }
 
+    set_source_type(result, local_queue);
     return result;
 }
 
 static kk_task_t* kk_try_pop_global( kk_task_group_t* tg, kk_context_t* ctx) {
     pthread_mutex_lock(&tg->tasks_lock);
     kk_task_t* task = pop_global_locked( tg, ctx );
+    if (task != NULL) {
+        set_source_type(task, global_queue);
+    }
     pthread_mutex_unlock(&tg->tasks_lock);
     return task;
 }
@@ -484,6 +607,9 @@ static kk_task_t* try_steal_tasks(kk_task_group_t* tg, kk_local_queue_t* lq, siz
             kk_assert(lq->lq);
             size_t num_stolen = kk_ws_queue_steal(sq->lq, lq->lq, (uintptr_t*)&task);
             if (num_stolen > 0) {
+                if (task != NULL) {
+                    set_source_type(task, stolen);
+                }
                 return task;
             }
         }
@@ -503,56 +629,38 @@ static kk_task_t* kk_try_pop_before_park( kk_task_group_t* tg, kk_local_queue_t*
 }
 
 
-static bool try_start_spinning(kk_task_group_t* tg) {
-    while (true) {
-        size_t state = kk_atomic_load_seq_cst(&tg->state);
-        size_t num_spinning = (state << 32) >> 32;
-        //do not allow more then 1/2 workers to spin
-        if (num_spinning + 1 > tg->workers_count / 2) {
-            return false;
-        }
-
-        size_t new_state = state + 1;
-
-        if (kk_atomic_cas_weak_seq_cst(&tg->state, &state, new_state)) {
-            return true;
-        }
-    }
-}
-
-//returns
-//was this worker last spinner?
-static bool stop_spinning(kk_task_group_t* tg) {
-    size_t prev_state = kk_atomic_dec_seq_cst(&tg->state);
-    size_t num_spinning = (prev_state << 32) >> 32;
-    return num_spinning == 1;
-}
-
 static kk_task_t* kk_try_pop( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context_t* ctx) {
 
     //sometimes we need to pop from global queue for load balancing
     kk_task_t* task = NULL;
     if (lq->gqueue_counter % dvyukov_const == 0) {
         if ((task = kk_try_pop_global(tg, ctx))) {
+            if (lq->ps.is_spinning) {
+                reset_spinning(tg, &lq->ps);
+            }
             return task;
         }
     }
 
     if ((task = kk_try_pop_local(tg, lq, ctx))) {
+        if (lq->ps.is_spinning) {
+            reset_spinning(tg, &lq->ps);
+        }
         return task;
     }
 
     if ((task = kk_try_grab_global(tg, lq, ctx))) {
+        if (lq->ps.is_spinning) {
+            reset_spinning(tg, &lq->ps);
+        }
         return task;
     }
 
-    if (try_start_spinning(tg)) {
+    if (lq->ps.is_spinning || try_become_spinning(tg, &lq->ps)) {
         task = try_steal_tasks(tg, lq, 4, ctx);
-        bool last = stop_spinning(tg);
-        if (task && last) {
-            //found task
-            //last spinner must wake new worker
-            wake_worker(tg);
+        if (task) {
+            //found task, no spinning anymore
+            reset_spinning(tg, &lq->ps);
         }
         return task;
     }
@@ -565,6 +673,19 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
         kk_task_t* task = NULL;
         if ((task = kk_try_pop(tg, lq, ctx))) {
             return task;
+        }
+
+        //we found no work
+        //but another worker did, and set the flag
+        if (!lq->ps.is_spinning && kk_atomic_load_seq_cst(&tg->need_spinning)) {
+            become_spinning(tg, &lq->ps);
+            continue;
+        }
+
+        //decrement numspinning
+        if (lq->ps.is_spinning) {
+            lq->ps.is_spinning = false;
+            kk_atomic_dec_seq_cst(&tg->state);
         }
 
         uint32_t epoch = prepare_park(&lq->ps);
@@ -582,7 +703,9 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
         }
 
         try_park(&lq->ps, epoch);
-        become_active(tg, &lq->ps);
+        lq->ps.is_spinning = true;
+        //todo must be not needed
+        //become_active(tg, &lq->ps);
 
     }
 
@@ -592,18 +715,19 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
 static void kk_enqueue_local( kk_task_group_t* tg, kk_task_t* task, bool islifo, kk_context_t* ctx) {
     kk_local_queue_t* lq = ctx->local_queue;
 
-    if (!kk_try_push(lq, task, islifo, ctx)) {
+    kk_task_t* overflow_task = kk_try_push(lq, task, islifo, ctx);
+    if (overflow_task != NULL) {
         //try push failed
         //offload 1/2 tasks to global queue
         kk_task_t* tasks_buff[queue_size / 2];
         size_t num_grabbed = kk_ws_queue_grab(lq->lq, (uintptr_t*)tasks_buff);
-        kk_task_t* thead = task;
-        kk_task_t* ttail = task;
+        kk_task_t* thead = overflow_task;
+        kk_task_t* ttail = overflow_task;
         for (size_t i = 0; i < num_grabbed; ++i) {
             ttail->next = tasks_buff[i];
             ttail = tasks_buff[i];
         }
-        kk_enqueue_n_global(tg, thead, ttail, num_grabbed, ctx);
+        kk_enqueue_n_global(tg, thead, ttail, num_grabbed + 1, ctx); //+1 because task is also there
     }
 }
 
@@ -656,6 +780,7 @@ static void* kk_task_group_worker( void* vargs ) {
      if (task == NULL) {  // due to tg->done
        break;
      }
+     kk_assert(!lq->ps.is_spinning);
      kk_task_exec(task,ctx);
      // todo: ensure context is cleared again?
   }
@@ -766,7 +891,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(0,kk_get_context());
+  task_group = kk_task_group_alloc(2,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {
@@ -815,6 +940,7 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   //kk_box_drop(p->result,ctx);
   p->result = r;
   uint32_t prev_state = promise_set_result(p);
+  kk_assert(!(prev_state & p_set));
   if (prev_state & p_cb_set) { //callback already set
     kk_assert(p->cb);
     kk_assert(p->cb_this);
@@ -835,6 +961,7 @@ static void promise_set_cb( kk_promise_t pr, void* cb_this, promise_cb_t* cb, kk
   p->cb = cb;
 
   uint32_t prev_state = promise_set_cb_flag(p);
+  kk_assert(!(prev_state & p_cb_set));
   if (prev_state & p_set) {
     kk_assert(!kk_box_is_any(p->result));
     *(kk_box_t*)cb_this = kk_box_dup(p->result, ctx); //invariant - cb_this always starts with kk_box_t
@@ -957,17 +1084,20 @@ kk_promise_t kk_promise_transform (kk_promise_t pr, kk_function_t fun, kk_contex
 typedef struct join_cb_s {
     kk_box_t result;
     kk_promise_t p;
+    kk_atomic(size_t) used;
 } join_cb_t;
 
 static void join_cb_inner(void* vthis) {
     join_cb_t* this = (join_cb_t*)vthis;
+    kk_assert(1 == kk_atomic_inc_seq_cst(&this->used));
     kk_context_t*    ctx = kk_get_context();
     kk_promise_set(this->p, this->result, ctx);
-    kk_free(this, ctx);
+    //kk_free(this, ctx);
 }
 
 static void join_cb(void* vthis) {
     join_cb_t* this = (join_cb_t*)vthis;
+    kk_assert(0 == kk_atomic_inc_seq_cst(&this->used));
     //todo unbox promise
     //tried it, looks like it works
     kk_assert(!kk_box_is_any(this->result));
