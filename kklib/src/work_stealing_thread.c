@@ -355,15 +355,16 @@ static void become_inactive(kk_task_group_t* tg, parking_slot_t* ps) {
 }
 
 
-static void become_active(kk_task_group_t* tg, parking_slot_t* ps) {
+static bool become_active(kk_task_group_t* tg, parking_slot_t* ps) {
     pthread_mutex_lock(&tg->idle_lock);
     if (ps->next == NULL && ps->prev == NULL) {
         pthread_mutex_unlock(&tg->idle_lock);
-        return;
+        return false;
     }
     unlink_node(ps);
     decr_idle(tg);
     pthread_mutex_unlock(&tg->idle_lock);
+    return true;
 }
 
 void wake_if_last(kk_task_group_t* tg) {
@@ -693,12 +694,22 @@ static kk_task_t* kk_pop ( kk_task_group_t* tg, kk_local_queue_t* lq, kk_context
         become_inactive(tg, &lq->ps);
 
         if ((task = kk_try_pop_before_park(tg, lq, ctx))) {
-            become_active(tg, &lq->ps);
+            //somebody else thought, it woke up idle thread, and incremented num_spinning
+            //decrement it back and potentially wake up new thread
+            if (!become_active(tg, &lq->ps)) {
+                kk_assert(!lq->ps.is_spinning);
+                lq->ps.is_spinning = true;
+                reset_spinning(tg, &lq->ps);
+            }
             return task;
         }
 
         if (kk_atomic_load_relaxed(&tg->done)) {
-            become_active(tg, &lq->ps);
+            if (!become_active(tg, &lq->ps)) {
+                kk_assert(!lq->ps.is_spinning);
+                lq->ps.is_spinning = true;
+                reset_spinning(tg, &lq->ps);
+            }
             return nullptr;
         }
 
@@ -891,7 +902,7 @@ static pthread_once_t task_group_once = PTHREAD_ONCE_INIT;
 static kk_task_group_t* task_group = NULL;
 
 static void kk_task_group_init(void) {
-  task_group = kk_task_group_alloc(2,kk_get_context());
+  task_group = kk_task_group_alloc(0,kk_get_context());
 }
 
 kk_promise_t kk_task_schedule( kk_function_t fun, kk_context_t* ctx ) {

@@ -3,7 +3,7 @@
 #define KK_WS_QUEUE_H
 
 enum kk_ws_queue_constants {
-    queue_size_pow = 3, //power of 2
+    queue_size_pow = 10, //power of 2
     queue_size = 1 << queue_size_pow,
 };
 
