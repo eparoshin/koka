@@ -1,7 +1,6 @@
 ﻿#pragma once
 #ifndef KKLIB_H
 #define KKLIB_H
-#undef KK_MIMALLOC
 /*---------------------------------------------------------------------------
   Copyright 2020-2022, Microsoft Research, Daan Leijen.
 
@@ -348,6 +347,7 @@ static inline void kk_block_field_idx_set(kk_block_t* b, uint8_t idx ) {
   This is passed by the code generator as an argument to every function so it can
   be (usually) accessed efficiently through a register.
 --------------------------------------------------------------------------------------*/
+#undef KK_MIMALLOC
 #ifdef KK_MIMALLOC
   #if !defined(MI_MAX_ALIGN_SIZE)
     #if (KK_MIMALLOC > 1)
