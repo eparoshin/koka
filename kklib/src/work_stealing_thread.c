@@ -131,7 +131,7 @@ static void kk_task_free( kk_task_t* task, kk_context_t* ctx ) {
         case internal_task:
             break;
     }
-    //kk_free(task,ctx);
+    kk_free(task,ctx);
 }
 
 static kk_task_t* kk_internal_task_alloc( void* cb_this, task_cb_t* cb, kk_context_t* ctx) {
@@ -946,7 +946,7 @@ err:
 static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   promise_t* p = (promise_t*)kk_cptr_raw_unbox_borrowed(pr, ctx);
   kk_box_mark_shared(r,ctx);
-  //kk_box_drop(p->result,ctx);
+  kk_box_drop(p->result,ctx);
   p->result = r;
   uint32_t prev_state = promise_set_result(p);
   kk_assert(!(prev_state & p_set));
@@ -961,7 +961,7 @@ static void kk_promise_set( kk_promise_t pr, kk_box_t r, kk_context_t* ctx ) {
   if (prev_state & p_wait_set) {
       promise_wake(p);
   }
-  //kk_box_drop(pr,ctx);
+  kk_box_drop(pr,ctx);
 }
 
 static void promise_set_cb( kk_promise_t pr, void* cb_this, promise_cb_t* cb, kk_context_t* ctx) {
@@ -1101,7 +1101,7 @@ static void join_cb_inner(void* vthis) {
     //kk_assert(1 == kk_atomic_inc_seq_cst(&this->used));
     kk_context_t*    ctx = kk_get_context();
     kk_promise_set(this->p, this->result, ctx);
-    //kk_free(this, ctx);
+    kk_free(this, ctx);
 }
 
 static void join_cb(void* vthis) {
@@ -1133,6 +1133,6 @@ kk_box_t kk_promise_get( kk_promise_t pr, kk_context_t* ctx ) {
       prev_state = kk_atomic_load_seq_cst(&p->state);
   }
   const kk_box_t result = kk_box_dup( p->result,ctx );
-  //kk_box_drop(pr,ctx);
+  kk_box_drop(pr,ctx);
   return result;
 }
