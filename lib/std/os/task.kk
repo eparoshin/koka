@@ -15,6 +15,8 @@ See ``test/bench/koka/binarytrees.kk`` for example usage.
 module std/os/task
 
 import std/num/int32
+import std/core/types
+import std/core/list
 
 // A `:promise<a>` can be `await`ed for a result.
 abstract struct promise<a>
@@ -26,12 +28,20 @@ noinline extern unsafe_task( work : () -> pure a ) : pure any
 noinline extern unsafe_await( p : any ) : pure a
   c "kk_promise_get"
 
+noinline extern unsafe_wait_all( ps : list<promise<a>> ) : any
+  c "kk_promise_wait_all"
+
+noinline extern unsafe_transform(p : any, f : (a) -> pure b) : pure any
+  c "kk_promise_transform"
+
+noinline extern unsafe_join(p : any) : pure any
+  c "kk_promise_join"
+
 extern prim-task-set-default-concurrency( thread-count : ssize_t  ) : io ()
   c "kk_task_set_default_concurrency"
 
 pub fun task-set-default-concurrency( thread-count : int ) : io ()
   prim-task-set-default-concurrency( thread-count.ssize_t )
-
 
 // Spark a pure computation in a separate thread of control.
 pub noinline fun task( work : () -> pure a ) : pure promise<a>
@@ -41,6 +51,21 @@ pub noinline fun task( work : () -> pure a ) : pure promise<a>
 pub fun await( p : promise<a> ) : pure a
   unsafe_await( p.promise )
 
+
+pub fun transform(p : promise<a>, f : (a) -> pure b) : pure promise<b>
+  Promise(unsafe_transform(p.promise, f))
+
+pub fun join(p : promise<promise<a>>) : pure promise<a>
+  Promise(unsafe_join(p.promise))
+
+fun transform_promise(head : promise<a>, tail : promise<list<a>>) : pure promise<list<a>>
+  head.transform(fn(h) tail.transform( fn(t) Cons(h, t) ) ).join
+
+pub fun wait_all( ps : list<promise<a>> ) : pure promise<list<a>>
+  //Promise(unsafe_wait_all( ps ))
+  val empty = task { Nil }
+  ps.foldr(empty, transform_promise)
+
 // Await the result of a list of promises.
 pub fun list/await( ps : list<promise<a>> ) : pure list<a>
   ps.map(await)
@@ -48,7 +73,6 @@ pub fun list/await( ps : list<promise<a>> ) : pure list<a>
 // Run a list of pure computations in parallel.
 pub fun parallel( xs : list<() -> pure a> ) : pure list<a>
   xs.map( task ).await
-
 
 /*
 noinline extern unsafe_task_n( count : ssize_t, stride : ssize_t, work : () -> pure a, combine : (a,a) -> a ) : pure any
@@ -63,6 +87,7 @@ pub noinline fun taskn( count : int, stride : int, work : () -> pure a, combine 
 // LVar's
 // Note: currently unsafe in the pure effect!! needs work
 
+/*
 abstract struct lvar<a>
   lv : any
 

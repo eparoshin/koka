@@ -347,6 +347,7 @@ static inline void kk_block_field_idx_set(kk_block_t* b, uint8_t idx ) {
   This is passed by the code generator as an argument to every function so it can
   be (usually) accessed efficiently through a register.
 --------------------------------------------------------------------------------------*/
+#undef KK_MIMALLOC
 #ifdef KK_MIMALLOC
   #if !defined(MI_MAX_ALIGN_SIZE)
     #if (KK_MIMALLOC > 1)
@@ -403,6 +404,7 @@ typedef kk_datatype_t kk_box_any_t;
 
 // Workers run in a task_group
 typedef struct kk_task_group_s kk_task_group_t;
+typedef struct kk_local_queue_s kk_local_queue_t;
 
 //A yield context allows up to 8 continuations to be stored in-place
 #define KK_YIELD_CONT_MAX (8)
@@ -440,6 +442,7 @@ typedef struct kk_context_s {
   kk_function_t     log;              // logging function
   kk_function_t     out;              // std output
   kk_task_group_t*  task_group;       // task group for managing threads. NULL for the main thread.
+  kk_local_queue_t* local_queue;      // local queue for work stealing scheduler
 
   struct kk_random_ctx_s* srandom_ctx;// strong random using chacha20, initialized on demand
   kk_ssize_t        argc;             // command line argument count
@@ -1395,7 +1398,9 @@ typedef kk_box_t kk_field_addr_t;
 #include "kklib/os.h"
 #include "kklib/process.h"    // Process info (memory usage, run time etc.)
 #include "kklib/random.h"
-#include "kklib/thread.h"
+//#include "kklib/thread.h"
+#include "kklib/ws_queue.h"
+#include "kklib/work_stealing_thread.h"
 
 
 
